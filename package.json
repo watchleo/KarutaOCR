@@ -1,0 +1,29 @@
+{
+  "name": "karutaocr",
+  "version": "1.0.0",
+  "description": "OCR-powered Discord bot for ranking anime character names",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/watchleo63-design/KarutaOCR.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/watchleo63-design/KarutaOCR/issues"
+  },
+  "homepage": "https://github.com/watchleo63-design/KarutaOCR#readme",
+  "dependencies": {
+    "@google/genai": "^2.24.0",
+    "axios": "^1.20.0",
+    "discord.js-selfbot-v13": "^3.7.1",
+    "dotenv": "^18.0.3",
+    "form-data": "^4.0.6",
+    "string-similarity": "^4.0.4"
+  }
+}
