@@ -1,5 +1,7 @@
 require("dotenv").config();
 
+const fs = require("fs");
+const path = require("path");
 const { Client } = require("discord.js-selfbot-v13");
 const { GoogleGenAI } = require("@google/genai");
 const axios = require("axios");
@@ -16,6 +18,7 @@ const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNE
   .filter(Boolean)
   .slice(0, 1);
 const DROP_BOT_ID = process.env.DROP_BOT_ID || "";
+const KD_STATE_FILE = path.join(__dirname, "kd-state.json");
 
 const randomBetween = (min, max) => {
   if (max < min) [min, max] = [max, min];
@@ -32,6 +35,31 @@ const KdState = {
   pendingDrops: new Map(),
   nextScheduledCheck: null,
 };
+
+function loadKdState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(KD_STATE_FILE, "utf8"));
+    if (Number.isFinite(state.lastCommandAt) && state.lastCommandAt > 0) {
+      KdState.lastCommandAt = state.lastCommandAt;
+      console.log(`Restored last kd timestamp: ${new Date(state.lastCommandAt).toISOString()}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error("Could not restore kd state:", error.message);
+    }
+  }
+}
+
+function saveKdState() {
+  try {
+    fs.writeFileSync(
+      KD_STATE_FILE,
+      JSON.stringify({ lastCommandAt: KdState.lastCommandAt }, null, 2) + "\n"
+    );
+  } catch (error) {
+    console.error("Could not save kd state:", error.message);
+  }
+}
 
 const KdConfig = {
   startupDelayMs: 30 * 1000,
@@ -64,6 +92,7 @@ function validateConfig() {
 
 const client = new Client();
 const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+loadKdState();
 
 // ==============================
 // OCR FUNCTION
@@ -371,7 +400,9 @@ async function sendKdDrop() {
 
   if (!eligible) return;
 
+  const previousLastCommandAt = KdState.lastCommandAt;
   KdState.lastCommandAt = now;
+  let sent = false;
 
   await delay(randomBetween(KdConfig.preCommandDelayMs[0], KdConfig.preCommandDelayMs[1]));
 
@@ -389,11 +420,17 @@ async function sendKdDrop() {
       }
 
       await channel.send("kd");
+      sent = true;
+      saveKdState();
       console.log(`Sent kd in ${channelId}; waiting for the drop announcement.`);
     } catch (error) {
       KdState.pendingDrops.delete(channelId);
       console.error(`Failed to send kd in channel ${channelId}:`, error.message);
     }
+  }
+
+  if (!sent) {
+    KdState.lastCommandAt = previousLastCommandAt;
   }
 }
 
@@ -404,7 +441,10 @@ function isImageMessage(message) {
 
 function isDropAnnouncement(message) {
   if (DROP_BOT_ID && message.author.id !== DROP_BOT_ID) return false;
-  if (!/\bdropping\b/i.test(message.content || "")) return false;
+  const content = message.content || "";
+  const isActiveServerDrop = /\b(?:i'm|i am)\s+dropping\s+\d+\s+cards?\b/i.test(content);
+  const isMentionedUserDrop = /<@!?\d+>\s+is\s+dropping\s+\d+\s+cards?\b/i.test(content);
+  if (!isActiveServerDrop && !isMentionedUserDrop) return false;
 
   if (DROP_BOT_ID) return true;
 
@@ -414,12 +454,18 @@ function isDropAnnouncement(message) {
 
 function isGrabSuccessMessage(message) {
   const content = message.content || "";
-  return /\byou\b.*\b(?:grabbed|got|took)\b.*\bcard\b/i.test(content) || /\bgrabbed\b.*\bcard\b/i.test(content);
+  return /\byou\b.*\b(?:grabbed|got|took)\b.*\bcard\b/i.test(content);
 }
 
 function isGrabFailureMessage(message) {
   const content = message.content || "";
-  return /\b(?:took|claimed)\b.*\bcard\b/i.test(content) && !/\byou\b.*\b(?:grabbed|got|took)\b.*\bcard\b/i.test(content);
+  return /\byou\b.*\b(?:lost|missed|failed to claim|couldn't claim|could not claim)\b.*\bcard\b/i.test(content);
+}
+
+function isGrabStatusMessage(message) {
+  return DROP_BOT_ID
+    ? message.author.id === DROP_BOT_ID
+    : Boolean(message.author?.bot);
 }
 
 async function handleCardDrop(message) {
@@ -507,6 +553,8 @@ client.on("ready", () => {
 client.on("messageCreate", async (message) => {
   if (!message.author?.bot || message.author.id === client.user?.id) return;
 
+  if (!isGrabStatusMessage(message)) return;
+
   if (isGrabSuccessMessage(message)) {
     markGrabResult(true);
     console.log(`Successful grab confirmation detected: ${message.content}`);
@@ -520,24 +568,31 @@ client.on("messageCreate", async (message) => {
   }
 
   const channelId = message.channel.id;
+
+  if (isDropAnnouncement(message)) {
+    if (!TARGET_CHANNELS.includes(channelId)) return;
+
+    if (isImageMessage(message)) {
+      console.log(`Drop announcement with image received in ${channelId}; starting OCR.`);
+      await handleCardDrop(message);
+      return;
+    }
+
+    KdState.pendingDrops.set(channelId, {
+      expiresAt: Date.now() + KdConfig.announcementTimeoutMs,
+      announcementId: message.id,
+      announcementBotId: message.author.id,
+    });
+    console.log(`Drop announcement detected in ${channelId}; waiting for its image.`);
+    return;
+  }
+
   const pendingDrop = KdState.pendingDrops.get(channelId);
   if (!pendingDrop) return;
 
   if (Date.now() > pendingDrop.expiresAt) {
     KdState.pendingDrops.delete(channelId);
     console.log(`Drop announcement timed out in ${channelId}; ignoring the message.`);
-    return;
-  }
-
-  if (isDropAnnouncement(message)) {
-    pendingDrop.announcementId = message.id;
-    pendingDrop.announcementBotId = message.author.id;
-    console.log(`Drop announcement confirmed in ${channelId}; waiting for its image.`);
-
-    if (isImageMessage(message)) {
-      KdState.pendingDrops.delete(channelId);
-      await handleCardDrop(message);
-    }
     return;
   }
 
