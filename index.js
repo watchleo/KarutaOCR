@@ -31,6 +31,7 @@ const KdState = {
   lastCommandAt: 0,
   lastGrabAt: 0,
   lastGrabSuccess: false,
+  pendingGrab: null,
   processing: new Set(),
   pendingDrops: new Map(),
   nextScheduledCheck: null,
@@ -73,7 +74,9 @@ const KdConfig = {
   announcementTimeoutMs: 30 * 1000,
   preCommandDelayMs: [200, 1200],
   channelDelayMs: [200, 700],
-  reactionDelayMs: [300, 1200],
+  reactionDelayMs: [1500, 2500],
+  reactionReadyTimeoutMs: 15 * 1000,
+  reactionPollMs: [800, 1200],
 };
 
 function validateConfig() {
@@ -92,6 +95,7 @@ function validateConfig() {
 
 const client = new Client();
 const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+let geminiNextAllowedAt = 0;
 loadKdState();
 
 // ==============================
@@ -146,22 +150,38 @@ function extractNames(ocrResult) {
     })
     .filter((line) => line.text && Number.isFinite(line.center) && Number.isFinite(line.top));
 
-  const metadataLines = overlayLines.filter((line) => /\b\d{4,7}\s*[•·.,]?\s*\d{1,2}\b/.test(line.text));
-  if (metadataLines.length > 0) {
-    return metadataLines
-      .sort((a, b) => a.center - b.center)
-      .map((metadataLine) => {
-        const columnLines = overlayLines
-          .slice()
-          .sort((a, b) => a.top - b.top)
-          .filter((line) => Math.abs(line.center - metadataLine.center) < 120);
-        const metadataIndex = columnLines.findIndex((line) => line === metadataLine);
-        const precedingLines = columnLines.slice(0, metadataIndex);
-        return precedingLines[0]?.text;
-      })
-      .filter(Boolean)
-      .slice(0, 4);
+  const columns = [];
+  for (const line of overlayLines.slice().sort((a, b) => a.center - b.center)) {
+    const column = columns.find((candidate) => Math.abs(candidate.center - line.center) < 120);
+    if (column) {
+      column.lines.push(line);
+      column.center = (column.center + line.center) / 2;
+    } else {
+      columns.push({ center: line.center, lines: [line] });
+    }
   }
+
+  const namesFromColumns = columns
+    .sort((a, b) => a.center - b.center)
+    .map((column) => {
+      const columnLines = column.lines.slice().sort((a, b) => a.top - b.top);
+      const metadataIndex = columnLines.findIndex((line, index) => {
+        if (!/\b\d{4,7}\b/.test(line.text)) return false;
+        if (/(?:[•·.,-]\s*)\d{1,2}\b/.test(line.text)) return true;
+        return columnLines
+          .slice(index + 1, index + 3)
+          .some((nextLine) => /^(?:[•·.,-]\s*)?\d{1,2}$/.test(nextLine.text));
+      });
+
+      if (metadataIndex < 1) return null;
+      return columnLines
+        .slice(0, metadataIndex)
+        .find((line) => !/^\d+$/.test(line.text))?.text;
+    })
+    .filter(Boolean)
+    .slice(0, 4);
+
+  if (namesFromColumns.length > 0) return namesFromColumns;
 
   const lines = ocrResult.text
     .split("\n")
@@ -193,11 +213,26 @@ function cleanName(name) {
     .trim();
 }
 
+function extractPrintNumbers(ocrResult) {
+  const text = (ocrResult.text || "").replace(/[·•]/g, "-");
+  return [...text.matchAll(/\b\d{4,7}\s*-\s*(\d{1,3})\b/g)].map((match) => Number(match[1]));
+}
+
+function printTier(printNumber) {
+  if (!Number.isInteger(printNumber)) return 0;
+  if (printNumber < 10) return 3;
+  if (printNumber < 100) return 2;
+  return 1;
+}
+
 // ==============================
 // SMART MATCHER (AniList + similarity)
 // ==============================
 async function getBestCharacterMatch(rawName) {
   const cleaned = cleanName(rawName);
+  const searchName = characterAliases.get(cleaned) || rawName;
+  const cacheKey = cleanName(searchName);
+  if (characterMatchCache.has(cacheKey)) return characterMatchCache.get(cacheKey);
 
   const query = `
     query ($search: String) {
@@ -213,13 +248,15 @@ async function getBestCharacterMatch(rawName) {
   try {
     const res = await axios.post("https://graphql.anilist.co", {
       query,
-      variables: { search: rawName }
+      variables: { search: searchName }
     });
 
     const chars = res.data.data.Page.characters;
 
     if (!chars || chars.length === 0) {
-      return { name: rawName, score: 0, found: false, source: "anilist" };
+      const result = { name: rawName, score: 0, found: false, source: "anilist" };
+      characterMatchCache.set(cacheKey, result);
+      return result;
     }
 
     let best = chars[0];
@@ -237,16 +274,20 @@ async function getBestCharacterMatch(rawName) {
       }
     }
 
-    return {
+    const result = {
       name: best.name.full,
       score: best.favourites || 0,
       found: bestScore >= 0.35,
       source: "anilist"
     };
+    characterMatchCache.set(cacheKey, result);
+    return result;
 
   } catch (err) {
     console.error(`AniList lookup failed for ${rawName}:`, err.message);
-    return { name: rawName, score: 0, found: false, source: "anilist" };
+    const result = { name: rawName, score: 0, found: false, source: "anilist" };
+    characterMatchCache.set(cacheKey, result);
+    return result;
   }
 }
 
@@ -273,6 +314,15 @@ async function getPopularity(names) {
 }
 
 async function evaluateWithGemini(names, anilistResults) {
+  const cacheKey = names.map(cleanName).join("|");
+  if (geminiEvaluationCache.has(cacheKey)) return geminiEvaluationCache.get(cacheKey);
+  if (Date.now() < geminiNextAllowedAt) {
+    console.log("Gemini request cooldown is active; skipping duplicate fallback request.");
+    return anilistResults;
+  }
+
+  geminiNextAllowedAt = Date.now() + 5 * 1000;
+
   const prompt = [
     "You are ranking characters for a Discord card grab.",
     "Use Google Search grounding to identify every character and compare current overall popularity.",
@@ -325,8 +375,10 @@ async function evaluateWithGemini(names, anilistResults) {
     console.log(`Gemini evaluation:\n${evaluated
       .map((result) => `- ${result.name} (${result.series || "unknown series"}): ${result.score}/100, confidence ${result.confidence || 0}`)
       .join("\n")}`);
+    geminiEvaluationCache.set(cacheKey, evaluated);
     return evaluated;
   } catch (error) {
+    geminiNextAllowedAt = Date.now() + 60 * 1000;
     console.error("Gemini fallback failed; no reaction will be sent:", error.message);
     return anilistResults;
   }
@@ -336,6 +388,11 @@ async function evaluateWithGemini(names, anilistResults) {
 // DROP / CLAIM LOGIC
 // ==============================
 const reactionEmojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"];
+const characterMatchCache = new Map();
+const geminiEvaluationCache = new Map();
+const characterAliases = new Map([
+  ["akira inuyama", "akari inuyama"],
+]);
 
 function canSendKdNow() {
   const now = Date.now();
@@ -352,6 +409,14 @@ function canSendKdNow() {
 }
 
 function canGrabNow() {
+  if (KdState.pendingGrab) {
+    if (KdState.pendingGrab.expiresAt > Date.now()) return false;
+    KdState.pendingGrab = null;
+    KdState.lastGrabAt = Date.now();
+    KdState.lastGrabSuccess = false;
+    console.log("Grab confirmation timed out; failure cooldown updated.");
+  }
+
   const cooldownMs = KdState.lastGrabSuccess
     ? KdConfig.grabCooldownMs + randomBetween(0, KdConfig.grabCooldownJitterMs)
     : KdConfig.failedGrabCooldownMs;
@@ -362,6 +427,7 @@ function canGrabNow() {
 function markGrabResult(success) {
   KdState.lastGrabAt = Date.now();
   KdState.lastGrabSuccess = Boolean(success);
+  KdState.pendingGrab = null;
   console.log(`Grab result recorded: ${success ? "success" : "failed"}; cooldown updated.`);
 }
 
@@ -439,27 +505,53 @@ function isImageMessage(message) {
   return attachment?.contentType?.startsWith("image") ? attachment : null;
 }
 
+async function waitForReaction(message, emoji) {
+  const deadline = Date.now() + KdConfig.reactionReadyTimeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const currentMessage = typeof message.fetch === "function"
+        ? await message.fetch()
+        : message;
+      const reaction = currentMessage.reactions.cache.get(emoji);
+      if (reaction && reaction.count > 0) return currentMessage;
+    } catch (error) {
+      console.log(`Could not refresh reactions for ${message.id}: ${error.message}`);
+    }
+
+    await delay(randomBetween(KdConfig.reactionPollMs[0], KdConfig.reactionPollMs[1]));
+  }
+
+  return null;
+}
+
 function isDropAnnouncement(message) {
   if (DROP_BOT_ID && message.author.id !== DROP_BOT_ID) return false;
   const content = message.content || "";
   const isActiveServerDrop = /\b(?:i'm|i am)\s+dropping\s+\d+\s+cards?\b/i.test(content);
-  const isMentionedUserDrop = /<@!?\d+>\s+is\s+dropping\s+\d+\s+cards?\b/i.test(content);
+  const userId = client.user?.id;
+  const isMentionedUserDrop = userId
+    ? new RegExp(`<@!?${userId}>\\s+is\\s+dropping\\s+\\d+\\s+cards?\\b`, "i").test(content)
+    : false;
   if (!isActiveServerDrop && !isMentionedUserDrop) return false;
 
-  if (DROP_BOT_ID) return true;
-
-  const userId = client.user?.id;
-  return Boolean(userId && message.mentions.users.has(userId));
+  return isActiveServerDrop || isMentionedUserDrop;
 }
 
 function isGrabSuccessMessage(message) {
   const content = message.content || "";
-  return /\byou\b.*\b(?:grabbed|got|took)\b.*\bcard\b/i.test(content);
+  const userId = client.user?.id;
+  const mentionsCurrentUser = userId && new RegExp(`<@!?${userId}>`, "i").test(content);
+  return (mentionsCurrentUser || /\byou\b/i.test(content))
+    && /\b(?:grabbed|got|took)\b.*\bcard\b/i.test(content);
 }
 
 function isGrabFailureMessage(message) {
   const content = message.content || "";
-  return /\byou\b.*\b(?:lost|missed|failed to claim|couldn't claim|could not claim)\b.*\bcard\b/i.test(content);
+  const userId = client.user?.id;
+  const mentionsCurrentUser = userId && new RegExp(`<@!?${userId}>`, "i").test(content);
+  return (mentionsCurrentUser || /\byou\b/i.test(content))
+    && /\b(?:lost|missed|failed to claim|couldn't claim|could not claim)\b.*\bcard\b/i.test(content);
 }
 
 function isGrabStatusMessage(message) {
@@ -513,7 +605,12 @@ async function handleCardDrop(message) {
         .map((result) => `- ${result.name}: ${result.score} favourites (slot ${result.index + 1})`)
         .join("\n")}`
     );
-    results.sort((a, b) => b.score - a.score);
+    const printNumbers = extractPrintNumbers(text);
+    results.forEach((result, index) => {
+      result.printNumber = printNumbers[index];
+      result.printTier = printTier(result.printNumber);
+    });
+    results.sort((a, b) => b.printTier - a.printTier || b.score - a.score);
 
     const chosen = results[0];
     const slotIndex = Math.min(Math.max(chosen.index, 0), reactionEmojis.length - 1);
@@ -524,9 +621,20 @@ async function handleCardDrop(message) {
       const reactionDelay = randomBetween(KdConfig.reactionDelayMs[0], KdConfig.reactionDelayMs[1]);
       console.log(`Waiting ${reactionDelay}ms before reacting to ${message.id}.`);
       await delay(reactionDelay);
-      await message.react(emoji);
-      markGrabResult(true);
-      console.log(`Grab completed; 10-minute success cooldown is now active.`);
+      console.log(`Waiting for the ${emoji} reaction to appear on ${message.id}.`);
+      const readyMessage = await waitForReaction(message, emoji);
+      if (!readyMessage) {
+        console.log(`The ${emoji} reaction did not appear for ${message.id}; no grab attempted.`);
+        return;
+      }
+
+      await readyMessage.react(emoji);
+      KdState.pendingGrab = {
+        messageId: message.id,
+        emoji,
+        expiresAt: Date.now() + KdConfig.announcementTimeoutMs,
+      };
+      console.log(`Grab reaction sent for ${message.id}; waiting for confirmation before starting cooldown.`);
     } catch (error) {
       markGrabResult(false);
       console.error(`Grab failed for ${message.id}; 1-minute failure cooldown is now active:`, error.message);
@@ -556,12 +664,14 @@ client.on("messageCreate", async (message) => {
   if (!isGrabStatusMessage(message)) return;
 
   if (isGrabSuccessMessage(message)) {
+    if (!KdState.pendingGrab) return;
     markGrabResult(true);
     console.log(`Successful grab confirmation detected: ${message.content}`);
     return;
   }
 
   if (isGrabFailureMessage(message)) {
+    if (!KdState.pendingGrab) return;
     markGrabResult(false);
     console.log(`Grab failure detected: ${message.content}`);
     return;
