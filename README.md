@@ -7,7 +7,7 @@ A Discord user bot that OCRs character name screenshots and reacts to the most p
 1. Create a `.env` file in the project root.
 2. Put your Discord user account token into `DISCORD_USER_TOKEN`.
 3. Add your OCR.Space API key to `OCR_API_KEY`.
-4. Add your Google Gemini API key to `GEMINI_API_KEY` and set `GEMINI_MODEL` to `gemini-3.1-flash-lite`, which supports the Google Search grounding used by this bot.
+4. Add your Google Gemini API key to `GEMINI_API_KEY` and set `GEMINI_MODEL` to `gemini-3.1-flash-lite`. Google Search grounding is disabled by default for free-tier compatibility; enable it with `GEMINI_USE_GOOGLE_SEARCH=true` only when your key supports it.
 5. Optionally add `TARGET_CHANNELS` as a comma-separated list of channel IDs.
 6. Set `DROP_BOT_ID` to the user ID of the bot that announces and posts the card drop.
 7. Start the bot:
@@ -23,6 +23,7 @@ A Discord user bot that OCRs character name screenshots and reacts to the most p
    OCR_API_KEY=your_ocr_space_key
    GEMINI_API_KEY=your_google_gemini_api_key
    GEMINI_MODEL=gemini-3.1-flash-lite
+   GEMINI_USE_GOOGLE_SEARCH=false
    DISCORD_USER_TOKEN=your_discord_user_token
    TARGET_CHANNELS=123456789012345678
    DROP_BOT_ID=your_karuta_bot_user_id

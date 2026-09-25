@@ -11,6 +11,7 @@ const stringSimilarity = require("string-similarity");
 const OCR_API_KEY = process.env.OCR_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+const GEMINI_USE_GOOGLE_SEARCH = /^(1|true|yes)$/i.test(process.env.GEMINI_USE_GOOGLE_SEARCH || "");
 const DISCORD_USER_TOKEN = process.env.DISCORD_USER_TOKEN || process.env.DISCORD_TOKEN;
 const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNELS || "")
   .split(",")
@@ -325,7 +326,9 @@ async function evaluateWithGemini(names, anilistResults) {
 
   const prompt = [
     "You are ranking characters for a Discord card grab.",
-    "Use Google Search grounding to identify every character and compare current overall popularity.",
+    GEMINI_USE_GOOGLE_SEARCH
+      ? "Use Google Search grounding to identify every character and compare current overall popularity."
+      : "Use your existing knowledge to identify every character and compare overall popularity. Do not invent an identity when uncertain.",
     "Characters may come from anime, manga, games, or other media.",
     "Return ONLY valid JSON with this exact shape:",
     '{"characters":[{"index":0,"identity":"...","series":"...","popularityScore":0,"confidence":0,"evidence":"..."}]}',
@@ -336,15 +339,19 @@ async function evaluateWithGemini(names, anilistResults) {
   ].join("\n");
 
   try {
-    console.log(`AniList missed a name; asking Gemini (${GEMINI_MODEL}) with Google Search grounding.`);
+    const geminiConfig = {
+      responseMimeType: "application/json",
+      temperature: 0.1,
+    };
+    if (GEMINI_USE_GOOGLE_SEARCH) {
+      geminiConfig.tools = [{ googleSearch: {} }];
+    }
+
+    console.log(`AniList missed a name; asking Gemini (${GEMINI_MODEL})${GEMINI_USE_GOOGLE_SEARCH ? " with Google Search grounding" : " without extra tools"}.`);
     const response = await gemini.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        tools: [{ googleSearch: {} }],
-        temperature: 0.1,
-      },
+      config: geminiConfig,
     });
 
     const parsed = JSON.parse(response.text.trim());
