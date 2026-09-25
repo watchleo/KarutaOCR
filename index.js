@@ -10,7 +10,7 @@ const stringSimilarity = require("string-similarity");
 
 const OCR_API_KEY = process.env.OCR_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
 const DISCORD_USER_TOKEN = process.env.DISCORD_USER_TOKEN || process.env.DISCORD_TOKEN;
 const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNELS || "")
   .split(",")
