@@ -509,7 +509,7 @@ function canSendKdNow() {
     return true;
   }
 
-  const minimumInterval = KdConfig.commandIntervalMs + randomBetween(0, KdConfig.commandJitterMs);
+  const minimumInterval = KdConfig.commandIntervalMs;
   const minimumHardRate = KdConfig.hardRateLimitMs + randomBetween(0, KdConfig.hardRateLimitJitterMs);
 
   return elapsedSinceLastCommand >= minimumInterval && elapsedSinceLastCommand >= minimumHardRate;
@@ -538,23 +538,28 @@ function markGrabResult(success) {
   console.log(`Grab result recorded: ${success ? "success" : "failed"}; cooldown updated.`);
 }
 
-function scheduleNextKdCheck() {
+function scheduleNextKdCheck(delayOverrideMs) {
   if (KdState.nextScheduledCheck) {
     clearTimeout(KdState.nextScheduledCheck);
   }
 
-  const nextDelay = randomBetween(
-    KdConfig.commandIntervalMs,
-    KdConfig.commandIntervalMs + KdConfig.commandJitterMs
-  );
+  const nextDelay = delayOverrideMs ?? (KdState.lastCommandAt
+    ? Math.max(0, KdState.lastCommandAt + KdConfig.commandIntervalMs - Date.now())
+    : KdConfig.commandIntervalMs) + randomBetween(0, KdConfig.commandJitterMs);
 
-  KdState.nextScheduledCheck = setTimeout(() => {
-    if (!KdState.processing.size) {
-      sendKdDrop().catch((error) => {
-        console.error("KD send failed:", error);
-      });
+  KdState.nextScheduledCheck = setTimeout(async () => {
+    if (KdState.processing.size) {
+      scheduleNextKdCheck(5000);
+      return;
     }
-    scheduleNextKdCheck();
+
+    try {
+      await sendKdDrop();
+    } catch (error) {
+      console.error("KD send failed:", error);
+    } finally {
+      scheduleNextKdCheck();
+    }
   }, nextDelay);
 }
 
@@ -759,10 +764,8 @@ client.on("ready", () => {
   setTimeout(() => {
     sendKdDrop().catch((error) => {
       console.error("Initial KD send failed:", error);
-    });
+    }).finally(() => scheduleNextKdCheck());
   }, KdConfig.startupDelayMs);
-
-  scheduleNextKdCheck();
 });
 
 client.on("messageCreate", async (message) => {
