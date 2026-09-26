@@ -1,16 +1,17 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const fs = require("fs");
-const path = require("path");
 const { Client } = require("discord.js-selfbot-v13");
 const axios = require("axios");
-const cheerio = require("cheerio");
 const FormData = require("form-data");
 const stringSimilarity = require("string-similarity");
 
 const OCR_API_KEY = process.env.OCR_API_KEY;
 const HF_TOKEN = process.env.HF_TOKEN || process.env.HUGGINGFACE_API_TOKEN;
-const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-7B-Instruct:fastest";
+const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen3-8B";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const EXA_API_KEY = process.env.EXA_API_KEY;
 const DISCORD_USER_TOKEN = process.env.DISCORD_USER_TOKEN || process.env.DISCORD_TOKEN;
 const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNELS || "")
   .split(",")
@@ -342,52 +343,76 @@ async function getPopularity(cards) {
     console.log("Hugging Face is not configured; unresolved names cannot be evaluated.");
     return results;
   }
+  if (!TAVILY_API_KEY && !EXA_API_KEY) {
+    console.log("Web search is not configured; set TAVILY_API_KEY or EXA_API_KEY.");
+    return results;
+  }
 
   return evaluateWithHuggingFace(cards, results);
 }
 
-async function searchDuckDuckGo(cards) {
+async function searchTavily(query) {
+  const response = await axios.post("https://api.tavily.com/search", {
+    api_key: TAVILY_API_KEY,
+    query,
+    search_depth: "basic",
+    max_results: 3,
+    include_answer: false,
+    include_raw_content: false,
+  }, {
+    timeout: 15000,
+  });
+
+  return (response.data.results || []).map((result) => ({
+    title: typeof result.title === "string" ? result.title.trim().slice(0, 200) : "",
+    snippet: typeof result.content === "string" ? result.content.trim().slice(0, 500) : "",
+    url: typeof result.url === "string" ? result.url : "",
+  })).filter((result) => result.title && result.snippet && result.url);
+}
+
+async function searchExa(query) {
+  const response = await axios.post("https://api.exa.ai/search", {
+    query,
+    type: "neural",
+    numResults: 3,
+    contents: { text: { maxCharacters: 500 } },
+  }, {
+    headers: { "x-api-key": EXA_API_KEY },
+    timeout: 15000,
+  });
+
+  return (response.data.results || []).map((result) => ({
+    title: typeof result.title === "string" ? result.title.trim().slice(0, 200) : "",
+    snippet: typeof result.text === "string" ? result.text.trim().slice(0, 500) : "",
+    url: typeof result.url === "string" ? result.url : "",
+  })).filter((result) => result.title && result.snippet && result.url);
+}
+
+async function searchWeb(cards) {
   const cardResults = [];
 
   for (const [index, card] of cards.entries()) {
     if (index > 0) await delay(randomBetween(700, 1100));
     const query = [card.name, card.series, "character"].filter(Boolean).join(" ");
+    let results = [];
 
-    try {
-      const response = await axios.get("https://html.duckduckgo.com/html/", {
-        params: { q: query },
-        headers: {
-          "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-        timeout: 15000,
-      });
-      const $ = cheerio.load(response.data);
-      const results = $(".result").toArray().map((element) => {
-        const result = $(element);
-        const anchor = result.find(".result__a").first();
-        const snippet = result.find(".result__snippet").first().text().trim();
-        const href = anchor.attr("href");
-        if (!anchor.text().trim() || !snippet || !href) return null;
-
-        let url = href;
-        try {
-          const parsedUrl = new URL(href, "https://duckduckgo.com");
-          url = parsedUrl.searchParams.get("uddg") || parsedUrl.href;
-        } catch {}
-
-        return {
-          title: anchor.text().trim().slice(0, 200),
-          snippet: snippet.slice(0, 500),
-          url,
-        };
-      }).filter(Boolean).slice(0, 3);
-
-      cardResults.push({ index, query, results });
-    } catch (error) {
-      console.error(`DuckDuckGo search failed for ${card.name}:`, error.message);
-      cardResults.push({ index, query, results: [] });
+    if (TAVILY_API_KEY) {
+      try {
+        results = await searchTavily(query);
+      } catch (error) {
+        console.error(`Tavily search failed for ${card.name}:`, error.message);
+      }
     }
+
+    if (!results.length && EXA_API_KEY) {
+      try {
+        results = await searchExa(query);
+      } catch (error) {
+        console.error(`Exa search failed for ${card.name}:`, error.message);
+      }
+    }
+
+    cardResults.push({ index, query, results });
   }
 
   return cardResults;
@@ -403,7 +428,7 @@ async function evaluateWithHuggingFace(cards, anilistResults) {
 
   huggingFaceNextAllowedAt = Date.now() + 5 * 1000;
 
-  const webSearchResults = await searchDuckDuckGo(cards);
+  const webSearchResults = await searchWeb(cards);
 
   const prompt = [
     "Identify and rank the characters in a card list for overall popularity.",
@@ -415,7 +440,7 @@ async function evaluateWithHuggingFace(cards, anilistResults) {
     "index must match the input index. popularityScore must be an integer from 0 to 100, where 100 is most popular among these cards.",
     "confidence must be a number from 0 to 1. Do not invent an identity; use confidence 0 when uncertain.",
     `Scanned cards (name and OCR series): ${JSON.stringify(cards)}`,
-    `DuckDuckGo web search results: ${JSON.stringify(webSearchResults)}`,
+    `Web search results: ${JSON.stringify(webSearchResults)}`,
     `AniList results: ${JSON.stringify(anilistResults.map(({ index, name, score, found }) => ({ index, name, score, found })))} `
   ].join("\n");
 
