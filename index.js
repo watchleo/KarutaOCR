@@ -191,6 +191,7 @@ function extractNames(ocrResult) {
       const columnLines = column.lines.slice().sort((a, b) => a.top - b.top);
       const metadataIndex = columnLines.findIndex((line, index) => {
         if (!/\b\d{1,7}\b/.test(line.text)) return false;
+        if (/^\d{4,7}$/.test(line.text.trim())) return true;
         if (/(?:[•·.,-]\s*)\d{1,3}\b/.test(line.text)) return true;
         return columnLines
           .slice(index + 1, index + 3)
