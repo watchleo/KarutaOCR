@@ -27,6 +27,17 @@ const randomBetween = (min, max) => {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 };
 
+const humanDelay = (min, max, hesitationChance = 0.08) => {
+  if (max < min) [min, max] = [max, min];
+  const first = Math.random();
+  const second = Math.random();
+  const typicalDelay = min + ((first + second) / 2) * (max - min);
+  const hesitation = Math.random() < hesitationChance
+    ? randomBetween(250, Math.max(250, Math.floor((max - min) * 0.35)))
+    : 0;
+  return Math.min(max + hesitation, Math.floor(typicalDelay + hesitation));
+};
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const KdState = {
@@ -34,6 +45,7 @@ const KdState = {
   lastGrabAt: 0,
   lastGrabSuccess: false,
   grabCooldownUntil: 0,
+  claimInProgress: false,
   pendingGrab: null,
   processing: new Set(),
   pendingDrops: new Map(),
@@ -80,7 +92,7 @@ const KdConfig = {
   channelDelayMs: [200, 700],
   reactionDelayMs: [1500, 2500],
   reactionReadyTimeoutMs: 15 * 1000,
-  reactionPollMs: [800, 1200],
+  reactionPollMs: [2500, 3500],
 };
 
 function validateConfig() {
@@ -97,7 +109,16 @@ function validateConfig() {
   }
 }
 
-const client = new Client();
+const client = new Client({
+  restGlobalRateLimit: 45,
+  invalidRequestWarningInterval: 1000,
+});
+client.on("rateLimit", (rateLimit) => {
+  console.warn("Discord rate limit reached:", rateLimit);
+});
+client.on("invalidRequestWarning", ({ count, remainingTime }) => {
+  console.warn(`Discord invalid request count: ${count}; window resets in ${remainingTime}ms.`);
+});
 let huggingFaceNextAllowedAt = 0;
 loadKdState();
 
@@ -623,7 +644,7 @@ async function sendKdDrop() {
   KdState.lastCommandAt = now;
   let sent = false;
 
-  await delay(randomBetween(KdConfig.preCommandDelayMs[0], KdConfig.preCommandDelayMs[1]));
+  await delay(humanDelay(KdConfig.preCommandDelayMs[0], KdConfig.preCommandDelayMs[1]));
 
   for (const [index, channelId] of channels.entries()) {
     const channel = client.channels.cache.get(channelId);
@@ -635,7 +656,7 @@ async function sendKdDrop() {
       });
 
       if (index > 0) {
-        await delay(randomBetween(KdConfig.channelDelayMs[0], KdConfig.channelDelayMs[1]));
+        await delay(humanDelay(KdConfig.channelDelayMs[0], KdConfig.channelDelayMs[1]));
       }
 
       await channel.send("kd");
@@ -723,7 +744,7 @@ async function handleCardDrop(message) {
     const attachment = isImageMessage(message);
     if (!attachment) return;
 
-    if (!testModeEnabled && !canGrabNow()) {
+    if (!canGrabNow()) {
       console.log(`Grab cooldown is active for ${message.id}; no reaction sent.`);
       return;
     }
@@ -772,9 +793,17 @@ async function handleCardDrop(message) {
     const slotIndex = Math.min(Math.max(chosen.index, 0), reactionEmojis.length - 1);
     const emoji = reactionEmojis[slotIndex];
 
+    if (KdState.claimInProgress || !canGrabNow()) return;
+    KdState.claimInProgress = true;
+
     console.log(`Most popular match for ${message.id}: ${chosen.name} (${chosen.score}); reacting ${emoji}.`);
     try {
-      const reactionDelay = randomBetween(KdConfig.reactionDelayMs[0], KdConfig.reactionDelayMs[1]);
+      const analysisDelay = Math.min(1400, Math.max(0, (results.length - 1) * 250));
+      const reactionDelay = humanDelay(
+        KdConfig.reactionDelayMs[0] + analysisDelay,
+        KdConfig.reactionDelayMs[1] + analysisDelay,
+        0.14
+      );
       console.log(`Waiting ${reactionDelay}ms before reacting to ${message.id}.`);
       await delay(reactionDelay);
       console.log(`Waiting for the ${emoji} reaction to appear on ${message.id}.`);
@@ -794,6 +823,8 @@ async function handleCardDrop(message) {
     } catch (error) {
       markGrabResult(false);
       console.error(`Grab failed for ${message.id}; 1-minute failure cooldown is now active:`, error.message);
+      } finally {
+        KdState.claimInProgress = false;
     }
   } catch (error) {
     console.error("Card drop processing failed:", error);
@@ -823,14 +854,9 @@ client.on("messageCreate", async (message) => {
   ) {
     testModeEnabled = command === ".teston";
     const status = testModeEnabled
-      ? "Test mode enabled; grab cooldown bypassed."
-      : "Test mode disabled; normal grab cooldown restored.";
+      ? "Test mode enabled; normal grab cooldown remains active."
+      : "Test mode disabled; normal grab cooldown remains active.";
     console.log(status);
-    if (message.author.id !== client.user?.id) {
-      await message.channel.send(status).catch((error) => {
-        console.error("Could not confirm test mode command:", error.message);
-      });
-    }
     return;
   }
 
