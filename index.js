@@ -33,6 +33,7 @@ const KdState = {
   lastCommandAt: 0,
   lastGrabAt: 0,
   lastGrabSuccess: false,
+  grabCooldownUntil: 0,
   pendingGrab: null,
   processing: new Set(),
   pendingDrops: new Map(),
@@ -541,24 +542,33 @@ function canSendKdNow() {
 }
 
 function canGrabNow() {
+  return grabCooldownRemainingMs() === 0;
+}
+
+function grabCooldownRemainingMs() {
+  const now = Date.now();
   if (KdState.pendingGrab) {
-    if (KdState.pendingGrab.expiresAt > Date.now()) return false;
+    if (KdState.pendingGrab.expiresAt > now) {
+      return KdState.pendingGrab.expiresAt - now + KdConfig.failedGrabCooldownMs;
+    }
+
+    KdState.lastGrabAt = KdState.pendingGrab.expiresAt;
     KdState.pendingGrab = null;
-    KdState.lastGrabAt = Date.now();
     KdState.lastGrabSuccess = false;
+    KdState.grabCooldownUntil = KdState.lastGrabAt + KdConfig.failedGrabCooldownMs;
     console.log("Grab confirmation timed out; failure cooldown updated.");
   }
 
-  const cooldownMs = KdState.lastGrabSuccess
-    ? KdConfig.grabCooldownMs + randomBetween(0, KdConfig.grabCooldownJitterMs)
-    : KdConfig.failedGrabCooldownMs;
-
-  return Date.now() - KdState.lastGrabAt >= cooldownMs;
+  return Math.max(0, KdState.grabCooldownUntil - now);
 }
 
 function markGrabResult(success) {
   KdState.lastGrabAt = Date.now();
   KdState.lastGrabSuccess = Boolean(success);
+  const cooldownMs = success
+    ? KdConfig.grabCooldownMs + randomBetween(0, KdConfig.grabCooldownJitterMs)
+    : KdConfig.failedGrabCooldownMs;
+  KdState.grabCooldownUntil = KdState.lastGrabAt + cooldownMs;
   KdState.pendingGrab = null;
   console.log(`Grab result recorded: ${success ? "success" : "failed"}; cooldown updated.`);
 }
@@ -568,9 +578,10 @@ function scheduleNextKdCheck(delayOverrideMs) {
     clearTimeout(KdState.nextScheduledCheck);
   }
 
-  const nextDelay = delayOverrideMs ?? (KdState.lastCommandAt
+  const scheduledDelay = delayOverrideMs ?? (KdState.lastCommandAt
     ? Math.max(0, KdState.lastCommandAt + KdConfig.commandIntervalMs - Date.now())
     : KdConfig.commandIntervalMs) + randomBetween(0, KdConfig.commandJitterMs);
+  const nextDelay = Math.max(scheduledDelay, grabCooldownRemainingMs());
 
   KdState.nextScheduledCheck = setTimeout(async () => {
     if (KdState.processing.size) {
@@ -597,6 +608,11 @@ async function sendKdDrop() {
   const channels = TARGET_CHANNELS.length > 1
     ? [...TARGET_CHANNELS].sort(() => Math.random() - 0.5)
     : TARGET_CHANNELS;
+
+  if (!canGrabNow()) {
+    console.log("Grab cooldown is active; delaying kd until it expires.");
+    return;
+  }
 
   const now = Date.now();
   const eligible = canSendKdNow();
