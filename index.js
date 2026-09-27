@@ -22,6 +22,107 @@ const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNE
 const DROP_BOT_ID = process.env.DROP_BOT_ID || "";
 const KD_STATE_FILE = path.join(__dirname, "kd-state.json");
 
+// ==============================
+// HUMAN BEHAVIOR MODULE
+// ==============================
+
+const HumanBehavior = {
+  baseWPM: { min: 45, max: 85 },
+  burstWPM: { min: 90, max: 120 },
+  readingSpeed: { min: 180, max: 320 },
+  comprehensionDelay: { min: 200, max: 800 },
+  sessionStartTime: Date.now(),
+  fatigueFactor: 0,
+  recentChoices: [],
+  maxMemorySize: 50,
+
+  personality: {
+    cautiousness: Math.random(),
+    consistency: 0.7 + (Math.random() * 0.25),
+    peakHours: [14, 15, 16, 20, 21, 22],
+  },
+
+  updateFatigue() {
+    const hoursActive = (Date.now() - this.sessionStartTime) / (1000 * 60 * 60);
+    this.fatigueFactor = Math.min(0.3, hoursActive * 0.05);
+  },
+
+  calculateReadingTime(text) {
+    const wordCount = text.split(/\s+/).length;
+    const complexity = /[•·]|\d{1,3}/.test(text) ? 1.4 : 1.0;
+    const wpm = randomBetween(this.readingSpeed.min, this.readingSpeed.max);
+    return Math.floor((wordCount / wpm) * 60 * 1000 * complexity);
+  },
+
+  calculateDecisionHesitation(cards, results) {
+    this.updateFatigue();
+
+    const topScores = results.filter(r => r.found).sort((a, b) => b.score - a.score);
+    const scoreGap = topScores.length >= 2 ? topScores[0].score - topScores[1].score : 100;
+
+    let hesitationMs = 0;
+    if (scoreGap < 20) hesitationMs += randomBetween(400, 1200);
+    if (cards.length > 2) hesitationMs += randomBetween(200, 600) * (cards.length - 2);
+
+    hesitationMs *= (1 + this.fatigueFactor);
+
+    if (Math.random() < this.personality.cautiousness * 0.3) {
+      hesitationMs += randomBetween(300, 800);
+    }
+
+    return Math.floor(hesitationMs);
+  },
+
+  async simulateTyping(channel, text) {
+    const isBurst = Math.random() < 0.15;
+    const wpm = isBurst
+      ? randomBetween(this.burstWPM.min, this.burstWPM.max)
+      : randomBetween(this.baseWPM.min, this.baseWPM.max);
+
+    const msPerChar = (60 * 1000) / (wpm * 5);
+    const totalDelay = text.length * msPerChar * randomBetween(90, 110) / 100;
+    await delay(Math.floor(totalDelay));
+    return channel.send(text);
+  },
+
+  shouldBeActive() {
+    const hour = new Date().getHours();
+    const isPeak = this.personality.peakHours.includes(hour);
+
+    if (!isPeak && Math.random() < 0.3) {
+      return false;
+    }
+
+    if (hour >= 2 && hour <= 7) {
+      return Math.random() < 0.05;
+    }
+
+    return true;
+  },
+
+  addEntropyToDelay(baseDelay) {
+    const u1 = 1 - Math.random();
+    const u2 = 1 - Math.random();
+    const gaussian = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+    const variance = baseDelay * 0.15;
+    return Math.max(0, Math.floor(baseDelay + (gaussian * variance)));
+  },
+
+  rememberChoice(choice) {
+    this.recentChoices.push({ choice, time: Date.now() });
+    if (this.recentChoices.length > this.maxMemorySize) {
+      this.recentChoices.shift();
+    }
+  },
+
+  getContextualDelayMultiplier() {
+    const recent = this.recentChoices.filter(r => Date.now() - r.time < 5 * 60 * 1000);
+    if (recent.length > 3) return 1.1;
+    if (recent.length === 0) return 0.95;
+    return 1.0;
+  }
+};
+
 const randomBetween = (min, max) => {
   if (max < min) [min, max] = [max, min];
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -37,6 +138,21 @@ const humanDelay = (min, max, hesitationChance = 0.08) => {
     : 0;
   return Math.min(max + hesitation, Math.floor(typicalDelay + hesitation));
 };
+
+function humanDelayEnhanced(min, max, hesitationChance = 0.12) {
+  const base = humanDelay(min, max, hesitationChance);
+
+  if (Math.random() < 0.25) {
+    const microPauses = randomBetween(1, 3);
+    let pauseTime = 0;
+    for (let i = 0; i < microPauses; i++) {
+      pauseTime += randomBetween(50, 300);
+    }
+    return base + pauseTime;
+  }
+
+  return base;
+}
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -88,11 +204,14 @@ const KdConfig = {
   hardRateLimitMs: 20 * 1000,
   hardRateLimitJitterMs: 5 * 1000,
   announcementTimeoutMs: 30 * 1000,
-  preCommandDelayMs: [200, 1200],
-  channelDelayMs: [200, 700],
-  reactionDelayMs: [1500, 2500],
+  claimWindowMs: 59 * 1000,
+  popularCardWindowMs: 10 * 1000,
+  claimSafetyMarginMs: 500,
+  preCommandDelayMs: [800, 2500],
+  channelDelayMs: [400, 1800],
+  reactionDelayMs: [2200, 4800],
   reactionReadyTimeoutMs: 15 * 1000,
-  reactionPollMs: [2500, 3500],
+  microPause: { min: 50, max: 300 },
 };
 
 function validateConfig() {
@@ -125,7 +244,7 @@ loadKdState();
 // ==============================
 // OCR FUNCTION
 // ==============================
-async function ocrSpace(imageUrl) {
+async function ocrSpace(imageUrl, timeoutMs) {
   try {
     const formData = new FormData();
     formData.append("url", imageUrl);
@@ -136,7 +255,7 @@ async function ocrSpace(imageUrl) {
     const res = await axios.post(
       "https://api.ocr.space/parse/image",
       formData,
-      { headers: formData.getHeaders() }
+      { headers: formData.getHeaders(), timeout: timeoutMs }
     );
 
     if (res.data.IsErroredOnProcessing) return null;
@@ -276,11 +395,16 @@ function seriesSimilarity(scannedSeries, media) {
   }, 0);
 }
 
+function characterMatchCacheKey(card) {
+  const cleanedName = cleanName(card.name);
+  const searchName = characterAliases.get(cleanedName) || card.name;
+  return `${cleanName(searchName)}|${cleanName(card.series)}`;
+}
+
 async function getBestCharacterMatch(card) {
   const rawName = card.name;
-  const cleaned = cleanName(rawName);
-  const searchName = characterAliases.get(cleaned) || rawName;
-  const cacheKey = `${cleanName(searchName)}|${cleanName(card.series)}`;
+  const searchName = characterAliases.get(cleanName(rawName)) || rawName;
+  const cacheKey = characterMatchCacheKey(card);
   if (characterMatchCache.has(cacheKey)) return characterMatchCache.get(cacheKey);
 
   const query = `
@@ -353,12 +477,15 @@ async function getBestCharacterMatch(card) {
 // GET POPULARITY FOR ALL
 // ==============================
 async function getPopularity(cards) {
-  const results = [];
-
-  for (let i = 0; i < cards.length; i++) {
-    const match = await getBestCharacterMatch(cards[i]);
-    results.push({ ...match, index: i });
-  }
+  const uniqueCards = new Map();
+  for (const card of cards) uniqueCards.set(characterMatchCacheKey(card), card);
+  const matches = new Map(await Promise.all(
+    [...uniqueCards].map(async ([key, card]) => [key, await getBestCharacterMatch(card)])
+  ));
+  const results = cards.map((card, index) => ({
+    ...matches.get(characterMatchCacheKey(card)),
+    index,
+  }));
 
   if (!results.some((result) => !result.found)) return results;
 
@@ -611,17 +738,23 @@ function scheduleNextKdCheck(delayOverrideMs) {
       return;
     }
 
+    let delayOverrideMs;
     try {
-      await sendKdDrop();
+      delayOverrideMs = await sendKdDrop();
     } catch (error) {
       console.error("KD send failed:", error);
     } finally {
-      scheduleNextKdCheck();
+      scheduleNextKdCheck(delayOverrideMs);
     }
   }, nextDelay);
 }
 
 async function sendKdDrop() {
+  if (!HumanBehavior.shouldBeActive()) {
+    console.log("Off-peak hours: delaying next check.");
+    return randomBetween(10, 30) * 60 * 1000;
+  }
+
   if (!TARGET_CHANNELS.length) {
     console.error("TARGET_CHANNELS is required; no kd command was sent.");
     return;
@@ -645,7 +778,8 @@ async function sendKdDrop() {
   KdState.lastCommandAt = now;
   let sent = false;
 
-  await delay(humanDelay(KdConfig.preCommandDelayMs[0], KdConfig.preCommandDelayMs[1]));
+  const preDelay = humanDelayEnhanced(KdConfig.preCommandDelayMs[0], KdConfig.preCommandDelayMs[1]);
+  await delay(preDelay);
 
   for (const [index, channelId] of channels.entries()) {
     const channel = client.channels.cache.get(channelId);
@@ -657,13 +791,20 @@ async function sendKdDrop() {
       });
 
       if (index > 0) {
-        await delay(humanDelay(KdConfig.channelDelayMs[0], KdConfig.channelDelayMs[1]));
+        const channelDelay = humanDelayEnhanced(
+          KdConfig.channelDelayMs[0],
+          KdConfig.channelDelayMs[1],
+          0.15
+        );
+        await delay(channelDelay);
       }
 
-      await channel.send("kd");
+      await HumanBehavior.simulateTyping(channel, "kd");
       sent = true;
       saveKdState();
       console.log(`Sent kd in ${channelId}; waiting for the drop announcement.`);
+
+      HumanBehavior.rememberChoice({ type: 'kd', channel: channelId });
     } catch (error) {
       KdState.pendingDrops.delete(channelId);
       console.error(`Failed to send kd in channel ${channelId}:`, error.message);
@@ -680,24 +821,31 @@ function isImageMessage(message) {
   return attachment?.contentType?.startsWith("image") ? attachment : null;
 }
 
-async function waitForReaction(message, emoji) {
-  const deadline = Date.now() + KdConfig.reactionReadyTimeoutMs;
+async function waitForReaction(message, emoji, timeoutMs = KdConfig.reactionReadyTimeoutMs) {
+  const getReadyMessage = (currentMessage) => {
+    const reaction = currentMessage.reactions.cache.get(emoji);
+    return reaction && reaction.count > 0 ? currentMessage : null;
+  };
+  const readyMessage = getReadyMessage(message);
+  if (readyMessage) return readyMessage;
 
-  while (Date.now() < deadline) {
-    try {
-      const currentMessage = typeof message.fetch === "function"
-        ? await message.fetch()
-        : message;
-      const reaction = currentMessage.reactions.cache.get(emoji);
-      if (reaction && reaction.count > 0) return currentMessage;
-    } catch (error) {
-      console.log(`Could not refresh reactions for ${message.id}: ${error.message}`);
-    }
+  return new Promise((resolve) => {
+    const finish = (currentMessage) => {
+      clearTimeout(timeout);
+      client.off("messageReactionAdd", onReactionAdd);
+      resolve(currentMessage);
+    };
+    const onReactionAdd = (reaction) => {
+      if (reaction.message.id !== message.id || reaction.emoji.toString() !== emoji) return;
+      const currentMessage = getReadyMessage(reaction.message);
+      if (currentMessage) finish(currentMessage);
+    };
+    const timeout = setTimeout(() => finish(null), timeoutMs);
 
-    await delay(randomBetween(KdConfig.reactionPollMs[0], KdConfig.reactionPollMs[1]));
-  }
-
-  return null;
+    client.on("messageReactionAdd", onReactionAdd);
+    const cachedMessage = getReadyMessage(message);
+    if (cachedMessage) finish(cachedMessage);
+  });
 }
 
 function isDropAnnouncement(message) {
@@ -737,13 +885,20 @@ function isGrabStatusMessage(message) {
     : Boolean(message.author?.bot);
 }
 
-async function handleCardDrop(message) {
+async function handleCardDrop(message, dropStartedAt = message.createdTimestamp) {
   if (KdState.processing.has(message.id)) return;
   KdState.processing.add(message.id);
 
   try {
+    const claimDeadlineAt = dropStartedAt + KdConfig.claimWindowMs;
+    const popularCardDeadlineAt = dropStartedAt + KdConfig.popularCardWindowMs;
     const attachment = isImageMessage(message);
     if (!attachment) return;
+
+    if (Date.now() >= claimDeadlineAt) {
+      console.log(`Claim window expired for ${message.id}; no reaction sent.`);
+      return;
+    }
 
     if (!canGrabNow()) {
       console.log(`Grab cooldown is active for ${message.id}; no reaction sent.`);
@@ -751,10 +906,26 @@ async function handleCardDrop(message) {
     }
 
     console.log(`Running OCR for drop image ${message.id}.`);
-    const text = await ocrSpace(attachment.url);
+    const ocrStart = Date.now();
+    const text = await ocrSpace(attachment.url, Math.max(1, claimDeadlineAt - Date.now()));
+    const ocrDuration = Date.now() - ocrStart;
     if (!text) {
       console.log(`OCR returned no text for ${message.id}; no reaction sent.`);
       return;
+    }
+    if (Date.now() >= claimDeadlineAt) {
+      console.log(`Claim window expired during OCR for ${message.id}; no reaction sent.`);
+      return;
+    }
+
+    const readingTime = HumanBehavior.calculateReadingTime(text.text);
+    const remainingReadTime = Math.max(0, readingTime - ocrDuration);
+    if (remainingReadTime > 0) {
+      const delayDeadlineAt = Date.now() < popularCardDeadlineAt
+        ? popularCardDeadlineAt
+        : claimDeadlineAt;
+      const availableDelay = Math.max(0, delayDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs);
+      await delay(Math.min(remainingReadTime, 3000, availableDelay));
     }
 
     console.log(`OCR text for ${message.id}:\n${text.text.trim()}`);
@@ -765,8 +936,20 @@ async function handleCardDrop(message) {
     }
 
     console.log(`Extracted cards: ${cards.map((card) => `${card.name} (${card.series || "series unknown"})`).join(", ")}`);
+
+    const thinkTime = cards.length * randomBetween(300, 700);
+    const thinkDeadlineAt = Date.now() < popularCardDeadlineAt
+      ? popularCardDeadlineAt
+      : claimDeadlineAt;
+    const availableThinkTime = Math.max(0, thinkDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs);
+    await delay(Math.min(thinkTime, availableThinkTime));
+
     console.log(`OCR found ${cards.length} names for ${message.id}; checking AniList popularity.`);
     const results = await getPopularity(cards);
+    if (Date.now() >= claimDeadlineAt) {
+      console.log(`Claim window expired during popularity lookup for ${message.id}; no reaction sent.`);
+      return;
+    }
     if (!results.length) {
       console.log(`Popularity lookup returned no results for ${message.id}; no reaction sent.`);
       return;
@@ -799,18 +982,73 @@ async function handleCardDrop(message) {
 
     console.log(`Most popular match for ${message.id}: ${chosen.name} (${chosen.score}); reacting ${emoji}.`);
     try {
-      const analysisDelay = Math.min(1400, Math.max(0, (results.length - 1) * 250));
-      const reactionDelay = humanDelay(
-        KdConfig.reactionDelayMs[0] + analysisDelay,
-        KdConfig.reactionDelayMs[1] + analysisDelay,
-        0.14
+      const decisionHesitation = HumanBehavior.calculateDecisionHesitation(cards, results);
+
+      const contextualMultiplier = HumanBehavior.getContextualDelayMultiplier();
+      const baseMin = Math.floor(KdConfig.reactionDelayMs[0] * contextualMultiplier);
+      const baseMax = Math.floor(KdConfig.reactionDelayMs[1] * contextualMultiplier);
+
+      const requestedReactionDelay = humanDelayEnhanced(
+        baseMin + decisionHesitation,
+        baseMax + decisionHesitation,
+        0.18
       );
+      const reactionDeadlineAt = Date.now() < popularCardDeadlineAt
+        ? popularCardDeadlineAt
+        : claimDeadlineAt;
+      const availableReactionDelay = Math.max(
+        0,
+        reactionDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs
+      );
+      const reactionDelay = Math.min(requestedReactionDelay, availableReactionDelay);
       console.log(`Waiting ${reactionDelay}ms before reacting to ${message.id}.`);
       await delay(reactionDelay);
+
+      if (Math.random() < 0.2 && Date.now() < claimDeadlineAt) {
+        const extraPauseDeadlineAt = Date.now() < popularCardDeadlineAt
+          ? popularCardDeadlineAt
+          : claimDeadlineAt;
+        const availablePause = Math.max(
+          0,
+          extraPauseDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs
+        );
+        await delay(Math.min(randomBetween(200, 600), availablePause));
+      }
+
+      if (Date.now() >= claimDeadlineAt) {
+        console.log(`Claim window expired before reaction for ${message.id}; no reaction sent.`);
+        return;
+      }
+
       console.log(`Waiting for the ${emoji} reaction to appear on ${message.id}.`);
-      const readyMessage = await waitForReaction(message, emoji);
+      const withinPopularCardWindow = Date.now() < popularCardDeadlineAt;
+      const readinessDeadlineAt = withinPopularCardWindow
+        ? popularCardDeadlineAt
+        : claimDeadlineAt;
+      const readinessTimeoutMs = Math.min(
+        KdConfig.reactionReadyTimeoutMs,
+        Math.max(0, readinessDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs)
+      );
+      let readyMessage = readinessTimeoutMs > 0
+        ? await waitForReaction(message, emoji, readinessTimeoutMs)
+        : null;
+      if (!readyMessage && withinPopularCardWindow && Date.now() < claimDeadlineAt) {
+        const fallbackTimeoutMs = Math.min(
+          KdConfig.reactionReadyTimeoutMs,
+          Math.max(0, claimDeadlineAt - Date.now() - KdConfig.claimSafetyMarginMs)
+        );
+        if (fallbackTimeoutMs > 0) {
+          console.log(`Popular-card window elapsed for ${message.id}; using the remaining claim window.`);
+          readyMessage = await waitForReaction(message, emoji, fallbackTimeoutMs);
+        }
+      }
       if (!readyMessage) {
-        console.log(`The ${emoji} reaction did not appear for ${message.id}; no grab attempted.`);
+        console.log(`The ${emoji} reaction did not appear within the remaining claim window for ${message.id}; no grab attempted.`);
+        return;
+      }
+
+      if (Date.now() >= claimDeadlineAt) {
+        console.log(`Claim window expired before reaction for ${message.id}; no reaction sent.`);
         return;
       }
 
@@ -820,6 +1058,12 @@ async function handleCardDrop(message) {
         emoji,
         expiresAt: Date.now() + KdConfig.announcementTimeoutMs,
       };
+
+      HumanBehavior.rememberChoice({
+        type: 'grab',
+        card: chosen.name,
+        slot: slotIndex
+      });
       console.log(`Grab reaction sent for ${message.id}; waiting for confirmation before starting cooldown.`);
     } catch (error) {
       markGrabResult(false);
@@ -834,14 +1078,33 @@ async function handleCardDrop(message) {
   }
 }
 
+// ==============================
+// RANDOM DISCONNECT SIMULATION
+// ==============================
+
+function simulateRealisticConnection() {
+  setInterval(() => {
+    if (Math.random() < 0.001) {
+      console.log("Connection hiccup simulated...");
+      const pauseDuration = randomBetween(2000, 8000);
+      KdState.grabCooldownUntil = Math.max(KdState.grabCooldownUntil, Date.now() + pauseDuration);
+    }
+  }, 60000);
+}
+
 client.on("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   setTimeout(() => {
-    sendKdDrop().catch((error) => {
+    sendKdDrop().then((delayOverrideMs) => {
+      scheduleNextKdCheck(delayOverrideMs);
+    }).catch((error) => {
       console.error("Initial KD send failed:", error);
-    }).finally(() => scheduleNextKdCheck());
+      scheduleNextKdCheck();
+    });
   }, KdConfig.startupDelayMs);
+
+  simulateRealisticConnection();
 });
 
 client.on("messageCreate", async (message) => {
@@ -886,12 +1149,13 @@ client.on("messageCreate", async (message) => {
 
     if (isImageMessage(message)) {
       console.log(`Drop announcement with image received in ${channelId}; starting OCR.`);
-      await handleCardDrop(message);
+      await handleCardDrop(message, message.createdTimestamp);
       return;
     }
 
     KdState.pendingDrops.set(channelId, {
-      expiresAt: Date.now() + KdConfig.announcementTimeoutMs,
+      expiresAt: message.createdTimestamp + KdConfig.claimWindowMs,
+      dropStartedAt: message.createdTimestamp,
       announcementId: message.id,
       announcementBotId: message.author.id,
     });
@@ -913,9 +1177,10 @@ client.on("messageCreate", async (message) => {
     pendingDrop.announcementBotId === message.author.id &&
     isImageMessage(message)
   ) {
+    const dropStartedAt = pendingDrop.dropStartedAt;
     KdState.pendingDrops.delete(channelId);
     console.log(`Drop image received in ${channelId}; starting OCR.`);
-    await handleCardDrop(message);
+    await handleCardDrop(message, dropStartedAt);
   }
 });
 
