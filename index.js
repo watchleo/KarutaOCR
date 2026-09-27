@@ -13,6 +13,7 @@ const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen3-8B";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
 const DISCORD_USER_TOKEN = process.env.DISCORD_USER_TOKEN || process.env.DISCORD_TOKEN;
+const TEST_MODE_CONTROL_USER_ID = process.env.TEST_MODE_CONTROL_USER_ID || "";
 const TARGET_CHANNELS = (process.env.TARGET_CHANNEL || process.env.TARGET_CHANNELS || "")
   .split(",")
   .map((id) => id.trim())
@@ -37,6 +38,7 @@ const KdState = {
   pendingDrops: new Map(),
   nextScheduledCheck: null,
 };
+let testModeEnabled = false;
 
 function loadKdState() {
   try {
@@ -222,14 +224,12 @@ function cleanName(name) {
 
 function extractPrintNumbers(ocrResult) {
   const text = (ocrResult.text || "").replace(/[·•]/g, "-");
-  return [...text.matchAll(/\b\d{1,7}\s*-\s*(\d{1,3})\b/g)].map((match) => Number(match[1]));
+  return [...text.matchAll(/\b(\d{1,7})\s*-\s*\d{1,3}\b/g)].map((match) => Number(match[1]));
 }
 
 function printTier(printNumber) {
   if (!Number.isInteger(printNumber)) return 0;
-  if (printNumber < 10) return 3;
-  if (printNumber < 100) return 2;
-  return 1;
+  return printNumber < 100 ? 1 : 0;
 }
 
 // ==============================
@@ -705,7 +705,7 @@ async function handleCardDrop(message) {
     const attachment = isImageMessage(message);
     if (!attachment) return;
 
-    if (!canGrabNow()) {
+    if (!testModeEnabled && !canGrabNow()) {
       console.log(`Grab cooldown is active for ${message.id}; no reaction sent.`);
       return;
     }
@@ -732,8 +732,9 @@ async function handleCardDrop(message) {
       return;
     }
 
-    if (results.some((result) => !result.found)) {
-      console.log(`At least one character could not be confidently evaluated; no reaction sent.`);
+    const eligibleResults = results.filter((result) => result.found);
+    if (!eligibleResults.length) {
+      console.log(`No character could be confidently evaluated for ${message.id}; no reaction sent.`);
       return;
     }
 
@@ -747,9 +748,9 @@ async function handleCardDrop(message) {
       result.printNumber = printNumbers[index];
       result.printTier = printTier(result.printNumber);
     });
-    results.sort((a, b) => b.printTier - a.printTier || b.score - a.score);
+    eligibleResults.sort((a, b) => b.printTier - a.printTier || b.score - a.score);
 
-    const chosen = results[0];
+    const chosen = eligibleResults[0];
     const slotIndex = Math.min(Math.max(chosen.index, 0), reactionEmojis.length - 1);
     const emoji = reactionEmojis[slotIndex];
 
@@ -794,6 +795,27 @@ client.on("ready", () => {
 });
 
 client.on("messageCreate", async (message) => {
+  const isDirectMessage = message.channel?.type === "DM" || message.channel?.type === 1;
+  const authorizedControllerId = TEST_MODE_CONTROL_USER_ID || client.user?.id;
+  const command = message.content?.trim().toLowerCase();
+  if (
+    isDirectMessage &&
+    message.author?.id === authorizedControllerId &&
+    (command === ".teston" || command === ".testoff")
+  ) {
+    testModeEnabled = command === ".teston";
+    const status = testModeEnabled
+      ? "Test mode enabled; grab cooldown bypassed."
+      : "Test mode disabled; normal grab cooldown restored.";
+    console.log(status);
+    if (message.author.id !== client.user?.id) {
+      await message.channel.send(status).catch((error) => {
+        console.error("Could not confirm test mode command:", error.message);
+      });
+    }
+    return;
+  }
+
   if (!message.author?.bot || message.author.id === client.user?.id) return;
 
   if (!isGrabStatusMessage(message)) return;
