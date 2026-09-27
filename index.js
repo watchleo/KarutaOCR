@@ -667,9 +667,11 @@ function isDropAnnouncement(message) {
   const content = message.content || "";
   const isActiveServerDrop = /\b(?:i'm|i am)\s+dropping\s+\d+\s+cards?\b/i.test(content);
   const userId = client.user?.id;
-  const isMentionedUserDrop = userId
-    ? new RegExp(`<@!?${userId}>\\s+is\\s+dropping\\s+\\d+\\s+cards?\\b`, "i").test(content)
-    : false;
+  const isMentionedUserDrop = testModeEnabled
+    ? /<@!?\d+>\s+is\s+dropping\s+\d+\s+cards?\b/i.test(content)
+    : userId
+      ? new RegExp(`<@!?${userId}>\\s+is\\s+dropping\\s+\\d+\\s+cards?\\b`, "i").test(content)
+      : false;
   if (!isActiveServerDrop && !isMentionedUserDrop) return false;
 
   return isActiveServerDrop || isMentionedUserDrop;
