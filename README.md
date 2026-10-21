@@ -1,6 +1,27 @@
 # KarutaOCR
 
-A Discord user bot that OCRs character name screenshots and reacts to the most popular anime character.
+> **Important: Discord account and Terms of Service warning**
+>
+> This project logs in with a **Discord user-account token** and automates activity
+> on that account, including sending messages and reacting to cards. Discord
+> prohibits automating normal user accounts (self-bots); using this software may
+> violate Discord's Terms of Service and may lead to account action or termination.
+> Do not run it unless Discord's current rules expressly permit your use.
+>
+> The human-like delays and typing simulation in this project do **not** make
+> self-bot use compliant, authorized, or undetectable, and are not a means to evade
+> platform enforcement. This notice is informational, not legal advice or a promise
+> that the software is permitted. You are responsible for checking and following
+> the applicable platform terms, laws, and third-party service terms.
+
+A Discord self-bot that OCRs character-name screenshots and automatically reacts to selected cards.
+
+## Project status
+
+This project is unfinished and has not worked reliably as intended; consider it a
+failed experiment rather than a ready-to-use tool. You are welcome to fix, adapt,
+or improve the code. Please review the platform-terms warning above before running
+it, and do not assume that improvements make user-account automation permitted.
 
 ## Setup
 
@@ -41,4 +62,13 @@ When at least one card is confidently evaluated, uncertain cards are skipped and
 
 The Discord client limits REST requests to 45 per second per running process and logs rate-limit and invalid-request warnings. This does not coordinate other processes using the same account or IP address.
 
-> This uses a Discord user account token rather than a bot token. Automating a user account may violate Discord's Terms of Service; use it only where permitted.
+## Security and credentials
+
+- Never commit `.env`, account tokens, API keys, or other credentials. `.env` is
+  ignored by Git; copy `.env.example` to `.env` and fill in your own values.
+- If a credential is exposed, revoke or rotate it with the provider immediately.
+- Do not send credentials in bug reports. See [SECURITY.md](SECURITY.md) for
+  vulnerability reporting guidance.
+
+This project depends on third-party APIs and libraries. Their terms, availability,
+and data handling policies apply independently of this project's license.
