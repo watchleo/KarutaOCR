@@ -506,9 +506,10 @@ class KarutaClient(discord.Client):
             self.pending_drops.pop(message.channel.id, None)
             return
 
-        evaluation = parse_evaluator_message(_message_text(message))
+        message_text = _message_text(message)
+        evaluation = parse_evaluator_message(message_text)
         if evaluation is None:
-            log.warning("Evaluator output had no parseable entries.")
+            log.warning("Evaluator output had no parseable entries: %r", message_text)
             return
 
         pending.evaluation = evaluation
