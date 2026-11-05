@@ -509,7 +509,14 @@ class KarutaClient(discord.Client):
         message_text = _message_text(message)
         evaluation = parse_evaluator_message(message_text)
         if evaluation is None:
-            log.warning("Evaluator output had no parseable entries: %r", message_text)
+            log.warning(
+                "Evaluator output had no parseable entries "
+                "(author_id=%s message_id=%s embeds=%d): %r",
+                message.author.id,
+                message.id,
+                len(message.embeds),
+                message_text,
+            )
             return
 
         pending.evaluation = evaluation

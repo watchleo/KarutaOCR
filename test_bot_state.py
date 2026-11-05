@@ -187,11 +187,21 @@ class BotStateTests(unittest.TestCase):
         client.config = SimpleNamespace(target_channels=(channel_id,))
         client.pending_drops = {channel_id: pending}
         message_text = "Unexpected evaluator format"
+        embeds = [
+            SimpleNamespace(
+                title=None,
+                description="",
+                fields=[],
+                footer=None,
+            )
+        ]
         evaluator_message = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
             channel=SimpleNamespace(id=channel_id),
             created_at=now,
             content=message_text,
-            embeds=[],
+            embeds=embeds,
         )
 
         with patch("bot.log.warning") as log_warning:
@@ -200,7 +210,12 @@ class BotStateTests(unittest.TestCase):
             )
 
         log_warning.assert_called_once_with(
-            "Evaluator output had no parseable entries: %r", message_text
+            "Evaluator output had no parseable entries "
+            "(author_id=%s message_id=%s embeds=%d): %r",
+            456,
+            789,
+            1,
+            message_text,
         )
         self.assertIsNone(pending.evaluation)
 
