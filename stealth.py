@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import threading
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 import discord
+
+log = logging.getLogger("karuta")
 
 # --------------------------------------------------------------------------
 # Timing primitives
@@ -206,29 +209,27 @@ class StealthProfile:
 # CAPTCHA
 # --------------------------------------------------------------------------
 
+class CaptchaRequired(RuntimeError):
+    """Raised when a CAPTCHA needs an operator-supplied key."""
+
+
 async def console_captcha_handler(captcha: Any, _client: discord.Client) -> str:
-    """Solve a CAPTCHA on the console instead of failing the login outright."""
+    """Return a configured CAPTCHA key or fail with actionable log output."""
     sitekey = getattr(captcha, "sitekey", "")
     rqdata = getattr(captcha, "rqdata", "")
     service = getattr(captcha, "service", "")
+    token = os.getenv("CAPTCHA_KEY", "").strip()
+    if token:
+        return token
 
-    print("\n" + "=" * 68, flush=True)
-    print("CAPTCHA required (service=%s sitekey=%s)" % (service, sitekey), flush=True)
-    print("Open https://discord.com/captcha , solve it, then copy", flush=True)
-    print("`captcha_key` out of DevTools -> Network -> the hcaptcha response", flush=True)
-    print("payload, or from localStorage['captcha_key'].", flush=True)
-    if rqdata:
-        print("rqdata: %s" % rqdata, flush=True)
-    print("=" * 68, flush=True)
-
-    for attempt in range(3):
-        token = await asyncio.to_thread(
-            input, "captcha_key (%d/3): " % (attempt + 1)
-        )
-        token = (token or "").strip()
-        if token:
-            return token
-    raise RuntimeError("No CAPTCHA solution supplied.")
+    log.error(
+        "CAPTCHA required (service=%s sitekey=%s rqdata=%s). "
+        "Set CAPTCHA_KEY and restart.",
+        service,
+        sitekey,
+        rqdata or "<none>",
+    )
+    raise CaptchaRequired("CAPTCHA required; set CAPTCHA_KEY and restart.")
 
 
 # --------------------------------------------------------------------------

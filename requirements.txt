@@ -1,5 +1,6 @@
-discord.py-self @ git+https://github.com/dolfies/discord.py-self.git@2ba64a9a997e151a9c259984e0a179b1fdf4aff4
-curl_cffi>=0.14,<1
+--find-links wheels
+discord.py-self==2.2.0a5340+g2ba64a9a
+curl_cffi==0.17.0
 python-dotenv>=1.0,<2
 tzlocal>=5.0,<6
 aiohttp>=3.9,<4

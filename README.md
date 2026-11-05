@@ -35,49 +35,64 @@ saved in `kd-state.json` under `DATA_DIR`.
 
 ## Deploy on Wispbyte
 
-Create a Python worker/bot server, not a web server. Use Python 3.12 if the
-panel offers a Python version selector.
+Create a server using Wispbyte's Python image. See Wispbyte's
+[Discord bot hosting guide](https://wispbyte.com/how-to-host-discord-bot-wispbyte)
+and [startup settings guide](https://wispbyte.com/kb/startup-settings). Use
+the Python 3.11 image used by this server (or another supported Python 3 image).
+The current plan has 512 MB RAM, 1 GB disk, and 35% CPU; member chunking and
+member caching are disabled by default to limit memory use.
 
-1. Upload `bot.py`, `evaluator.py`, `stealth.py`, `requirements.txt`, and
-   `Procfile` (or deploy the repository).
-2. Install dependencies:
+1. Upload the project files, including `requirements.txt` and the `wheels/`
+   directory, in the file manager, or deploy the repository through Wispbyte's
+   GitHub integration. Set `REQUIREMENTS_FILE` to `requirements.txt` and leave
+   **User Uploaded Files** set to `0` (false), or Wispbyte will skip dependency
+   installation. Its startup command installs requirements on each start;
+   check logs for pip errors.
 
-   ```sh
-   python3 -m pip install -r requirements.txt
-   ```
+   The exact `discord.py-self` wheel is included locally because the PyPI 2.1
+   release does not provide the `HeadersContext` API used here. Other
+   dependencies are resolved from PyPI; Wispbyte says its free tier supports
+   outbound internet and package installation. If installation fails, inspect
+   the startup log for the failing package. The included wheel is built from
+   the pinned upstream commit and has a checksum in `wheels/SHA256SUMS`.
 
-3. Set the startup command to:
+2. Set the **App py file** variable (`PY_FILE`) to `bot.py`; the default
+   startup command points to `main.py`. The generated startup command launches
+   the selected file. Keep its dependency-install clauses, but add `-u` to the
+   final Python invocation so it ends with
+   `/usr/local/bin/python -u /home/container/bot.py`. `Procfile` is not used by
+   this Wispbyte startup template.
 
-   ```sh
-   python3 -u bot.py
-   ```
+3. Configure `DISCORD_USER_TOKEN`, `TARGET_CHANNELS`, and `DROP_BOT_ID` using
+   a private `.env` file uploaded through Wispbyte's file manager; the listed
+   startup variables are not the app's Discord configuration. Matching
+   non-empty process environment values override `.env`.
 
-4. Configure the environment variables:
+   Also configure these optional values as needed:
 
    | Variable | Required | Description |
    |---|---|---|
-   | `DISCORD_USER_TOKEN` | Yes | Token for the account used by the client |
-   | `TARGET_CHANNELS` | Yes | Comma-separated channel IDs |
-   | `DROP_BOT_ID` | Yes | ID of the bot that posts drop announcements |
    | `WISHLIST_EVALUATOR_ID` | No | Evaluator ID; defaults to `1380936713639166082` |
    | `DATA_DIR` | Recommended | Writable persistent directory for state and lock files |
    | `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
+   | `CAPTCHA_KEY` | No | Operator-supplied CAPTCHA response; if unset, the process exits with a log message when challenged |
 
-   Other optional settings are listed in `.env.example`. Keep the token in
-   Wispbyte's private environment settings; do not put it in the startup command
-   or upload a `.env` containing credentials.
-   Dependency installation needs `git` in the server/build image and outbound
-   access to GitHub because `discord.py-self` is pinned to a Git commit. Verify
-   both are available in the Wispbyte image before installing requirements.
-   `python3 -u` enables unbuffered output for the worker console; if setting
-   `PYTHONUNBUFFERED`, configure it in the panel environment rather than only in
-   `.env`.
+   Keep `.env` private and never commit it; `.gitignore` excludes it. Other
+   optional settings are listed in `.env.example`. Keep **Additional Python
+   Packages** empty; dependencies are installed from `requirements.txt` on
+   startup. `PYTHONUNBUFFERED` in `.env` would be too late to configure the
+   interpreter; the `-u` startup option enables unbuffered logs.
 
 Use persistent storage for `DATA_DIR` so restarts retain the schedule, and run
-only one copy against the same account and data directory. No port or HTTP
-health check is needed. Check the worker logs for `Connected as ...` to confirm
-login. If a CAPTCHA is presented, the client asks for interactive console
-input; it cannot complete CAPTCHA in a panel without an interactive console.
+only one copy against the same account and data directory. The bot retries a
+busy instance lock a few times before exiting. No port or HTTP health check is
+needed. Check the worker logs for `Connected as ...` to confirm login. A
+CAPTCHA does not prompt for console input: provide a valid `CAPTCHA_KEY` through
+the panel or `.env` and restart, otherwise the process exits with instructions.
+Hosting network latency can make reactions slower than a local run.
+Wispbyte documents shared-IP Discord login limits; see its
+[Discord rate-limits guide](https://wispbyte.com/kb/discord-rate-limits) if the
+logs show repeated 429 or Cloudflare 1015 responses.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for additional deployment notes.
 

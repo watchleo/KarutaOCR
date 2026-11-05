@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import discord
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-from evaluator import choose_card, parse_evaluator_message
+from evaluator import Evaluation, choose_card, parse_evaluator_message
 from stealth import (
     Backoff,
+    CaptchaRequired,
     JsonStore,
     PresenceRotator,
     SingleInstance,
@@ -52,6 +53,8 @@ REACTION_DELAY_SECONDS = (0.07, 0.22)
 PENDING_DROP_TTL_SECONDS = 180
 SKIP_CHANCE = 0.02
 MAX_MESSAGE_ATTEMPTS = 3
+LOCK_RETRY_ATTEMPTS = 5
+LOCK_RETRY_SECONDS = 30
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("karuta")
@@ -80,6 +83,7 @@ class PendingDrop:
     announcement_id: int
     expires_at: float
     card_message: discord.Message | None = None
+    evaluation: Evaluation | None = None
     evaluation_processed: bool = False
 
 
@@ -128,14 +132,29 @@ def _detect_tz() -> str | None:
     return None if name in (None, "UTC", "Etc/UTC") else name
 
 
+def _load_config_file() -> None:
+    for key, value in dotenv_values(ROOT / ".env").items():
+        if value is not None and not os.getenv(key, "").strip():
+            os.environ[key] = value
+
+
 def load_config() -> Config:
-    load_dotenv(ROOT / ".env")
+    _load_config_file()
     token = os.getenv("DISCORD_USER_TOKEN", "").strip()
-    channels = tuple(
-        int(value.strip())
+    channel_values = [
+        value.strip()
         for value in os.getenv("TARGET_CHANNELS", "").split(",")
         if value.strip()
-    )
+    ]
+    channel_ids: list[int] = []
+    for value in channel_values:
+        try:
+            channel_ids.append(int(value))
+        except ValueError as error:
+            raise ValueError(
+                f"TARGET_CHANNELS contains an invalid channel ID: {value!r}."
+            ) from error
+    channels = tuple(channel_ids)
     if not token:
         raise ValueError("DISCORD_USER_TOKEN is required.")
     if not channels:
@@ -166,7 +185,7 @@ def load_config() -> Config:
         proxy=os.getenv("DISCORD_PROXY", "").strip() or None,
         timezone=timezone,
         cache_all_members=_env_flag("CACHE_ALL_MEMBERS"),
-        chunk_guilds=_env_flag("CHUNK_GUILDS", True),
+        chunk_guilds=_env_flag("CHUNK_GUILDS", False),
         max_messages=max(50, _env_int("MAX_MESSAGES", 200)),
         skip_chance=max(0.0, min(0.25, _env_float("SKIP_CHANCE", SKIP_CHANCE))),
     )
@@ -201,7 +220,9 @@ def _kd_payload() -> str:
 
 
 class KarutaClient(discord.Client):
-    def __init__(self, config: Config, store: JsonStore, installation_id: str) -> None:
+    def __init__(
+        self, config: Config, store: JsonStore, installation_id: str, backoff: Backoff
+    ) -> None:
         options: dict[str, object] = {
             "status": discord.Status.online,
             "assume_unsync_clock": False,      # mirror server clock, like the real client
@@ -209,7 +230,7 @@ class KarutaClient(discord.Client):
             "max_ratelimit_timeout": 60.0,
             "max_messages": config.max_messages,
             "chunk_guilds_at_startup": config.chunk_guilds,
-            "guild_subscriptions": True,
+            "guild_subscriptions": False,
             "installation_id": installation_id,  # stable X-Installation-ID
             "captcha_handler": console_captcha_handler,
             "debug_options": ["bugReporterEnabled"],
@@ -225,6 +246,7 @@ class KarutaClient(discord.Client):
 
         self.config = config
         self.store = store
+        self.backoff = backoff
         self.pending_drops: dict[int, PendingDrop] = {}
         self.pending_grab: PendingGrab | None = None
         self.grab_cooldown_until = 0.0
@@ -235,11 +257,6 @@ class KarutaClient(discord.Client):
         self._ready_count = 0
         self._presence = PresenceRotator(self, config.profile.activity_pool)
         self._close_requested = False
-
-        try:
-            self._connection.locale = config.profile.locale  # X-Discord-Locale
-        except Exception:
-            pass
 
     # ---------------- fingerprint ----------------
 
@@ -308,6 +325,7 @@ class KarutaClient(discord.Client):
             return
         self._ready_count += 1
         log.info("Connected as %s (session %s).", self.user, self._ready_count)
+        self.backoff.reset()
 
         # Any drop in flight belongs to the previous socket.
         self.pending_drops.clear()
@@ -457,7 +475,7 @@ class KarutaClient(discord.Client):
             if pending.expires_at + PENDING_DROP_TTL_SECONDS < now:
                 self.pending_drops.pop(channel_id, None)
 
-    def _attach_drop_image(self, message: discord.Message) -> PendingDrop | None:
+    async def _attach_drop_image(self, message: discord.Message) -> PendingDrop | None:
         pending = self.pending_drops.get(message.channel.id)
         if (
             pending is None
@@ -469,6 +487,7 @@ class KarutaClient(discord.Client):
             return pending
         pending.card_message = message
         log.info("Drop image received in %s.", message.channel.id)
+        await self._process_pending_drop(message.channel.id, pending)
         return pending
 
     # ---------------- evaluator / claim ----------------
@@ -479,9 +498,6 @@ class KarutaClient(discord.Client):
         pending = self.pending_drops.get(message.channel.id)
         if pending is None or pending.evaluation_processed:
             return
-        if pending.card_message is None:
-            log.info("Evaluator output arrived before the card image; ignoring.")
-            return
         if message.created_at.timestamp() > pending.expires_at:
             self.pending_drops.pop(message.channel.id, None)
             return
@@ -491,10 +507,20 @@ class KarutaClient(discord.Client):
             log.warning("Evaluator output had no parseable entries.")
             return
 
-        pending.evaluation_processed = True
+        pending.evaluation = evaluation
         if evaluation.expires_at is not None:
             pending.expires_at = min(pending.expires_at, float(evaluation.expires_at))
 
+        await self._process_pending_drop(message.channel.id, pending)
+
+    async def _process_pending_drop(self, channel_id: int, pending: PendingDrop) -> None:
+        evaluation = pending.evaluation
+        if self.pending_drops.get(channel_id) is not pending:
+            return
+        if pending.evaluation_processed or pending.card_message is None or evaluation is None:
+            return
+
+        pending.evaluation_processed = True
         chosen = choose_card(evaluation)
         if chosen is None:
             log.info("No eligible card in the evaluator output.")
@@ -606,7 +632,7 @@ class KarutaClient(discord.Client):
             self._record_drop_announcement(message)
             return
 
-        self._attach_drop_image(message)
+        await self._attach_drop_image(message)
 
 
 def main() -> None:
@@ -625,17 +651,18 @@ def main() -> None:
 
     try:
         try:
-            if not guard.acquire():
-                raise SystemExit("Another instance already holds this session.")
+            _acquire_guard(guard)
             installation_id = stable_installation_id(store)
         except OSError as error:
             raise SystemExit(f"Cannot initialize bot state: {error}") from error
 
         backoff = Backoff()
         while True:
-            client = KarutaClient(config, store, installation_id)
+            client = KarutaClient(config, store, installation_id, backoff)
             try:
                 client.run(config.token)
+            except CaptchaRequired as error:
+                raise SystemExit(str(error)) from error
             except KeyboardInterrupt:
                 break
             except discord.LoginFailure as error:
@@ -653,6 +680,24 @@ def main() -> None:
             time.sleep(delay)
     finally:
         guard.release()
+
+
+def _acquire_guard(guard: SingleInstance) -> None:
+    for attempt in range(1, LOCK_RETRY_ATTEMPTS + 1):
+        if guard.acquire():
+            return
+        if attempt == LOCK_RETRY_ATTEMPTS:
+            break
+        log.warning(
+            "Another instance holds this session; retrying in %s seconds (%s/%s).",
+            LOCK_RETRY_SECONDS,
+            attempt,
+            LOCK_RETRY_ATTEMPTS,
+        )
+        time.sleep(LOCK_RETRY_SECONDS)
+    raise SystemExit(
+        f"Another instance still holds this session after {LOCK_RETRY_ATTEMPTS} checks."
+    )
 
 
 if __name__ == "__main__":
