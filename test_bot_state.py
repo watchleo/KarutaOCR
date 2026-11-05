@@ -204,6 +204,42 @@ class BotStateTests(unittest.TestCase):
         )
         self.assertIsNone(pending.evaluation)
 
+    def test_evaluator_edit_is_processed(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = object.__new__(KarutaClient)
+        client._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+        client.config = SimpleNamespace(
+            target_channels=(channel_id,), evaluator_bot_id=456
+        )
+        client.pending_drops = {channel_id: pending}
+        client._process_pending_drop = AsyncMock()
+        before = SimpleNamespace()
+        after = SimpleNamespace(
+            author=SimpleNamespace(id=456),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content="",
+            embeds=[
+                SimpleNamespace(
+                    title=None,
+                    description="<:no_1:1> `♡` `2` · **First** · Series",
+                    fields=[],
+                    footer=None,
+                )
+            ],
+        )
+
+        asyncio.run(KarutaClient.on_message_edit(client, before, after))
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[0].name, "First")
+        client._process_pending_drop.assert_awaited_once_with(channel_id, pending)
+
     def test_evaluator_arriving_before_card_image_is_processed_later(self) -> None:
         channel_id = 123
         now = datetime.now(timezone.utc)

@@ -639,6 +639,15 @@ class KarutaClient(discord.Client):
 
         await self._attach_drop_image(message)
 
+    async def on_message_edit(
+        self, _before: discord.Message, after: discord.Message
+    ) -> None:
+        if self.user is None or after.author.id == self.user.id:
+            return
+
+        if after.author.id == self.config.evaluator_bot_id:
+            await self._handle_evaluator_message(after)
+
 
 def main() -> None:
     try:
