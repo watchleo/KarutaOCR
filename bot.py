@@ -51,6 +51,7 @@ ANNOUNCEMENT_TIMEOUT_SECONDS = 30
 TYPING_SECONDS = (1.1, 2.9)
 REACTION_DELAY_SECONDS = (0.07, 0.22)
 PENDING_DROP_TTL_SECONDS = 180
+EVALUATOR_SETTLE_SECONDS = 3.0
 SKIP_CHANCE = 0.02
 MAX_MESSAGE_ATTEMPTS = 3
 LOCK_RETRY_ATTEMPTS = 5
@@ -248,6 +249,7 @@ class KarutaClient(discord.Client):
         self.store = store
         self.backoff = backoff
         self.pending_drops: dict[int, PendingDrop] = {}
+        self._evaluator_tasks: dict[int, asyncio.Task[None]] = {}
         self.pending_grab: PendingGrab | None = None
         self.grab_cooldown_until = 0.0
         self.last_command_at = self._load_state()
@@ -351,6 +353,9 @@ class KarutaClient(discord.Client):
         self._presence.stop()
         if self.scheduler is not None and not self.scheduler.done():
             self.scheduler.cancel()
+        for task in self._evaluator_tasks.values():
+            task.cancel()
+        self._evaluator_tasks.clear()
         await super().close()
 
     # ---------------- scheduling ----------------
@@ -525,6 +530,31 @@ class KarutaClient(discord.Client):
 
         await self._process_pending_drop(message.channel.id, pending)
 
+    def _schedule_evaluator_message(self, message: discord.Message) -> None:
+        task = self._evaluator_tasks.get(message.id)
+        if task is not None:
+            task.cancel()
+        task = asyncio.create_task(self._process_evaluator_message_after_delay(message))
+        self._evaluator_tasks[message.id] = task
+        task.add_done_callback(self._log_evaluator_result)
+
+    async def _process_evaluator_message_after_delay(
+        self, message: discord.Message
+    ) -> None:
+        await asyncio.sleep(EVALUATOR_SETTLE_SECONDS)
+        if self._evaluator_tasks.get(message.id) is not asyncio.current_task():
+            return
+        self._evaluator_tasks.pop(message.id, None)
+        await self._handle_evaluator_message(message)
+
+    @staticmethod
+    def _log_evaluator_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("Evaluator processing failed: %r", error)
+
     async def _process_pending_drop(self, channel_id: int, pending: PendingDrop) -> None:
         evaluation = pending.evaluation
         if self.pending_drops.get(channel_id) is not pending:
@@ -620,7 +650,7 @@ class KarutaClient(discord.Client):
             return
 
         if message.author.id == self.config.evaluator_bot_id:
-            await self._handle_evaluator_message(message)
+            self._schedule_evaluator_message(message)
             return
 
         if message.author.id != self.config.drop_bot_id:
@@ -653,7 +683,7 @@ class KarutaClient(discord.Client):
             return
 
         if after.author.id == self.config.evaluator_bot_id:
-            await self._handle_evaluator_message(after)
+            self._schedule_evaluator_message(after)
 
 
 def main() -> None:

@@ -10,6 +10,8 @@
 
 This Python client sends `kd` in configured channels, watches for Karuta drop
 announcements, and reads the configured wishlist evaluator's follow-up message.
+It waits three seconds after the evaluator's latest message edit before parsing,
+so intermediate embed updates can settle.
 When print numbers are present, it reacts to the card with the lowest print
 number up to 999, skipping the drop if all print numbers exceed 999. If the
 evaluator omits print numbers, it chooses the slot with the highest positive

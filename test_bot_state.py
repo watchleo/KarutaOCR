@@ -232,9 +232,19 @@ class BotStateTests(unittest.TestCase):
             target_channels=(channel_id,), evaluator_bot_id=456
         )
         client.pending_drops = {channel_id: pending}
+        client._evaluator_tasks = {}
         client._process_pending_drop = AsyncMock()
         before = SimpleNamespace()
+        initial = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content="",
+            embeds=[],
+        )
         after = SimpleNamespace(
+            id=789,
             author=SimpleNamespace(id=456),
             channel=SimpleNamespace(id=channel_id),
             created_at=now,
@@ -249,7 +259,16 @@ class BotStateTests(unittest.TestCase):
             ],
         )
 
-        asyncio.run(KarutaClient.on_message_edit(client, before, after))
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                await KarutaClient.on_message_edit(client, before, initial)
+                await KarutaClient.on_message_edit(client, initial, after)
+                self.assertIsNone(pending.evaluation)
+                task = client._evaluator_tasks[after.id]
+                await task
+                sleep.assert_awaited_once_with(3.0)
+
+        asyncio.run(exercise())
 
         self.assertIsNotNone(pending.evaluation)
         self.assertEqual(pending.evaluation.cards[0].name, "First")
