@@ -149,16 +149,32 @@ class BotStateTests(unittest.TestCase):
 
     def test_captcha_handler_requires_configured_key_without_prompting(self) -> None:
         captcha = SimpleNamespace(service="hcaptcha", sitekey="site-key", rqdata="data")
-        with patch.dict(os.environ, {"CAPTCHA_KEY": ""}, clear=False):
-            with patch("stealth.log.error") as log_error:
-                with self.assertRaises(CaptchaRequired):
-                    asyncio.run(console_captcha_handler(captcha, None))
-        log_error.assert_called_once()
+        with (
+            patch.dict(os.environ, {"CAPTCHA_KEY": ""}, clear=False),
+            patch("stealth.CAPTCHA_RETRY_DELAY_SECONDS", 0.0),
+            patch("stealth._captcha_uses", 0),
+            patch("stealth.log.error") as log_error,
+        ):
+            with self.assertRaises(CaptchaRequired):
+                asyncio.run(console_captcha_handler(captcha, None))
+        log_error.assert_called()
 
     def test_captcha_handler_returns_configured_key(self) -> None:
-        with patch.dict(os.environ, {"CAPTCHA_KEY": "provided-response"}):
+        with (
+            patch.dict(os.environ, {"CAPTCHA_KEY": "provided-response"}),
+            patch("stealth._captcha_uses", 0),
+        ):
             result = asyncio.run(console_captcha_handler(SimpleNamespace(), None))
         self.assertEqual(result, "provided-response")
+
+    def test_captcha_handler_treats_second_use_as_stale(self) -> None:
+        with (
+            patch.dict(os.environ, {"CAPTCHA_KEY": "old"}),
+            patch("stealth.CAPTCHA_RETRY_DELAY_SECONDS", 0.0),
+            patch("stealth._captcha_uses", 1),
+        ):
+            with self.assertRaises(CaptchaRequired):
+                asyncio.run(console_captcha_handler(SimpleNamespace(), None))
 
     def test_evaluator_arriving_before_card_image_is_processed_later(self) -> None:
         channel_id = 123

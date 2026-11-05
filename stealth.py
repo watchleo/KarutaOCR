@@ -21,6 +21,8 @@ from typing import Any
 import discord
 
 log = logging.getLogger("karuta")
+CAPTCHA_RETRY_DELAY_SECONDS = 900.0
+_captcha_uses = 0
 
 # --------------------------------------------------------------------------
 # Timing primitives
@@ -214,22 +216,33 @@ class CaptchaRequired(RuntimeError):
 
 
 async def console_captcha_handler(captcha: Any, _client: discord.Client) -> str:
-    """Return a configured CAPTCHA key or fail with actionable log output."""
+    """Use a configured CAPTCHA key, else wait for one, then exit cleanly."""
+    global _captcha_uses
     sitekey = getattr(captcha, "sitekey", "")
     rqdata = getattr(captcha, "rqdata", "")
     service = getattr(captcha, "service", "")
+
     token = os.getenv("CAPTCHA_KEY", "").strip()
-    if token:
+    if token and _captcha_uses == 0:
+        _captcha_uses += 1
+        log.warning("CAPTCHA challenge; using configured CAPTCHA_KEY.")
         return token
+
+    if token:
+        _captcha_uses += 1
+        log.warning("CAPTCHA challenge again; CAPTCHA_KEY is stale or already used.")
 
     log.error(
         "CAPTCHA required (service=%s sitekey=%s rqdata=%s). "
-        "Set CAPTCHA_KEY and restart.",
+        "Open https://discord.com/captcha , solve it, and paste the captcha_key "
+        "into CAPTCHA_KEY. The panel restarts this process, which re-reads it.",
         service,
         sitekey,
         rqdata or "<none>",
     )
-    raise CaptchaRequired("CAPTCHA required; set CAPTCHA_KEY and restart.")
+    log.error("Waiting %d s for a fresh key before exiting.", CAPTCHA_RETRY_DELAY_SECONDS)
+    await asyncio.sleep(CAPTCHA_RETRY_DELAY_SECONDS)
+    raise CaptchaRequired("CAPTCHA required; set a fresh CAPTCHA_KEY.")
 
 
 # --------------------------------------------------------------------------

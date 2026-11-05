@@ -75,7 +75,7 @@ member caching are disabled by default to limit memory use.
    | `WISHLIST_EVALUATOR_ID` | No | Evaluator ID; defaults to `1380936713639166082` |
    | `DATA_DIR` | Recommended | Writable persistent directory for state and lock files |
    | `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
-   | `CAPTCHA_KEY` | No | Operator-supplied CAPTCHA response; if unset, the process exits with a log message when challenged |
+   | `CAPTCHA_KEY` | No | Operator-supplied, single-use CAPTCHA response; if unset or already used, the process waits before exiting when challenged |
 
    Keep `.env` private and never commit it; `.gitignore` excludes it. Other
    optional settings are listed in `.env.example`. Keep **Additional Python
@@ -88,7 +88,9 @@ only one copy against the same account and data directory. The bot retries a
 busy instance lock a few times before exiting. No port or HTTP health check is
 needed. Check the worker logs for `Connected as ...` to confirm login. A
 CAPTCHA does not prompt for console input: provide a valid `CAPTCHA_KEY` through
-the panel or `.env` and restart, otherwise the process exits with instructions.
+the panel or `.env` and restart. Clear CAPTCHA_KEY after you see `Connected as`;
+the token is single-use. Keep Auto Update off until .env exists on the server,
+since .env is gitignored and will not be cloned.
 Hosting network latency can make reactions slower than a local run.
 Wispbyte documents shared-IP Discord login limits; see its
 [Discord rate-limits guide](https://wispbyte.com/kb/discord-rate-limits) if the

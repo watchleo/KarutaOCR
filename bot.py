@@ -257,6 +257,10 @@ class KarutaClient(discord.Client):
         self._ready_count = 0
         self._presence = PresenceRotator(self, config.profile.activity_pool)
         self._close_requested = False
+        try:
+            self._connection.locale = config.profile.locale
+        except Exception:
+            pass
 
     # ---------------- fingerprint ----------------
 

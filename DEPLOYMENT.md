@@ -28,9 +28,8 @@ built from the pinned upstream commit; its SHA-256 is recorded in
 Wispbyte's default startup points to `/home/container/main.py`. Set the
 **App py file** variable (`PY_FILE`) to `bot.py`. Its generated startup command
 then launches the correct entry point. For Git deployment, configure
-`GIT_ADDRESS` and optionally `BRANCH`; enable **Auto Update** only if you want
-the panel to pull changes on each start. For file-manager uploads, upload all
-app files, the full `wheels/` directory, and `requirements.txt`.
+`GIT_ADDRESS` and optionally `BRANCH`. For file-manager uploads, upload all app
+files, the full `wheels/` directory, and `requirements.txt`.
 
 The startup command runs Python through a pipe. Keep the installation clauses
 from the default command, but add `-u` to its final Python invocation so it
@@ -55,7 +54,7 @@ live token in the startup command.
 | `TARGET_CHANNELS` | Yes | Comma-separated channel IDs |
 | `DROP_BOT_ID` | Yes | ID of the bot that posts drop announcements |
 | `WISHLIST_EVALUATOR_ID` | No | Evaluator bot ID; defaults to the value in `.env.example` |
-| `CAPTCHA_KEY` | No | Operator-supplied CAPTCHA response; if unset, the process exits with a log message when challenged |
+| `CAPTCHA_KEY` | No | Operator-supplied, single-use CAPTCHA response; if unset or already used, the process waits before exiting when challenged |
 | `DATA_DIR` | Recommended | Writable persistent directory for state and instance lock; defaults to the application directory |
 | `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
 
@@ -75,10 +74,12 @@ times before the process exits.
 ## Verify the deployment
 
 Start the worker and check its console logs. A successful login logs
-`Connected as ...`. If it exits, check the first configuration, dependency, or
-login error in the logs before restarting it. CAPTCHA handling does not read
-console input: set a valid `CAPTCHA_KEY` in the panel or private `.env` and
-restart, or the process exits with a clear message.
+`Connected as ...`. Clear CAPTCHA_KEY after you see `Connected as`; the token
+is single-use. Keep Auto Update off until .env exists on the server, since .env
+is gitignored and will not be cloned. If the process exits, check the first
+configuration, dependency, or login error in the logs before restarting it.
+CAPTCHA handling does not read console input: set a valid `CAPTCHA_KEY` in the
+panel or private `.env` and restart.
 
 The `CHUNK_GUILDS` default is off and `CACHE_ALL_MEMBERS` should remain off to
 limit memory use on small plans. Hosting network latency can make reactions

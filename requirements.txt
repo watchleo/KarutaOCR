@@ -1,4 +1,4 @@
---find-links wheels
+--find-links /home/container/wheels
 discord.py-self==2.2.0a5340+g2ba64a9a
 curl_cffi==0.17.0
 python-dotenv>=1.0,<2
