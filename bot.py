@@ -279,11 +279,28 @@ class KarutaClient(discord.Client):
         return value if value > 0 else 0.0
 
     def _save_state(self) -> None:
-        data = self.store.load()
-        data["last_command_at"] = self.last_command_at
-        self.store.save(data)
+        try:
+            data = self.store.load()
+            data["last_command_at"] = self.last_command_at
+            self.store.save(data)
+        except OSError as error:
+            log.error("State write failed: %s", error)
 
     # ---------------- lifecycle ----------------
+
+    def _spawn_scheduler(self) -> None:
+        if self.scheduler is not None and not self.scheduler.done():
+            return
+        self.scheduler = asyncio.create_task(self._command_scheduler())
+        self.scheduler.add_done_callback(self._log_scheduler_result)
+
+    @staticmethod
+    def _log_scheduler_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("Scheduler died: %r", error)
 
     async def on_ready(self) -> None:
         if self.user is None:
@@ -296,14 +313,12 @@ class KarutaClient(discord.Client):
         self.pending_drops.clear()
         self._seen_announcements.clear()
 
-        if self.scheduler is None or self.scheduler.done():
-            self.scheduler = asyncio.create_task(self._command_scheduler())
+        self._spawn_scheduler()
         self._presence.start()
 
     async def on_resumed(self) -> None:
         log.info("Session resumed.")
-        if self.scheduler is None or self.scheduler.done():
-            self.scheduler = asyncio.create_task(self._command_scheduler())
+        self._spawn_scheduler()
         self._presence.start()
 
     async def on_disconnect(self) -> None:
@@ -607,13 +622,16 @@ def main() -> None:
 
     store = JsonStore(config.data_dir / STATE_FILE.name)
     guard = SingleInstance(config.data_dir / LOCK_FILE.name)
-    if not guard.acquire():
-        raise SystemExit("Another instance already holds this session.")
-
-    installation_id = stable_installation_id(store)
-    backoff = Backoff()
 
     try:
+        try:
+            if not guard.acquire():
+                raise SystemExit("Another instance already holds this session.")
+            installation_id = stable_installation_id(store)
+        except OSError as error:
+            raise SystemExit(f"Cannot initialize bot state: {error}") from error
+
+        backoff = Backoff()
         while True:
             client = KarutaClient(config, store, installation_id)
             try:

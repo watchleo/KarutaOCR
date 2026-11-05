@@ -16,12 +16,18 @@ python3 -m pip install -r requirements.txt
 Set the server's startup command to:
 
 ```sh
-python3 bot.py
+python3 -u bot.py
 ```
 
 The included `Procfile` declares the same command as a worker for panels that
 support Procfile-based startup. Keep the process running as a worker; no port
 or HTTP health check is required.
+
+The pinned `discord.py-self` dependency is installed from a Git commit, so
+dependency installation requires both `git` in the server/build image and
+outbound access to GitHub. Verify that the Wispbyte image provides these before
+installing requirements. `curl_cffi` is separately constrained in
+`requirements.txt` for compatibility with the client's TLS implementation.
 
 ## Environment variables
 
@@ -35,11 +41,16 @@ put a live token in source control or the startup command.
 | `DROP_BOT_ID` | Yes | ID of the bot that posts drop announcements |
 | `WISHLIST_EVALUATOR_ID` | No | Evaluator bot ID; defaults to the value in `.env.example` |
 | `DATA_DIR` | Recommended | Writable persistent directory for state and instance lock; defaults to the application directory |
-| `DISCORD_TIMEZONE` | Recommended | IANA timezone, e.g. `Europe/Berlin` |
+| `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
 
 Other optional settings and their defaults are listed in `.env.example`.
 Configure only values you need; keep secrets in Wispbyte's private environment
 settings.
+
+`PYTHONUNBUFFERED` in `.env` does not affect the Python interpreter because
+`.env` is loaded after startup. The `-u` startup option above enables
+unbuffered output; if you use `PYTHONUNBUFFERED`, set it in Wispbyte's panel
+environment variables, not just in `.env`.
 
 The process writes `kd-state.json` and `.kd.pid` to `DATA_DIR`. Use a persistent
 directory so restarts retain the scheduler state, and run only one copy against

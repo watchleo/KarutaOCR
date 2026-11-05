@@ -49,7 +49,7 @@ panel offers a Python version selector.
 3. Set the startup command to:
 
    ```sh
-   python3 bot.py
+   python3 -u bot.py
    ```
 
 4. Configure the environment variables:
@@ -61,11 +61,17 @@ panel offers a Python version selector.
    | `DROP_BOT_ID` | Yes | ID of the bot that posts drop announcements |
    | `WISHLIST_EVALUATOR_ID` | No | Evaluator ID; defaults to `1380936713639166082` |
    | `DATA_DIR` | Recommended | Writable persistent directory for state and lock files |
-   | `DISCORD_TIMEZONE` | Recommended | IANA timezone, e.g. `Europe/Berlin` |
+   | `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
 
    Other optional settings are listed in `.env.example`. Keep the token in
    Wispbyte's private environment settings; do not put it in the startup command
    or upload a `.env` containing credentials.
+   Dependency installation needs `git` in the server/build image and outbound
+   access to GitHub because `discord.py-self` is pinned to a Git commit. Verify
+   both are available in the Wispbyte image before installing requirements.
+   `python3 -u` enables unbuffered output for the worker console; if setting
+   `PYTHONUNBUFFERED`, configure it in the panel environment rather than only in
+   `.env`.
 
 Use persistent storage for `DATA_DIR` so restarts retain the schedule, and run
 only one copy against the same account and data directory. No port or HTTP

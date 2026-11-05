@@ -212,14 +212,14 @@ async def console_captcha_handler(captcha: Any, _client: discord.Client) -> str:
     rqdata = getattr(captcha, "rqdata", "")
     service = getattr(captcha, "service", "")
 
-    print("\n" + "=" * 68)
-    print("CAPTCHA required (service=%s sitekey=%s)" % (service, sitekey))
-    print("Open https://discord.com/captcha , solve it, then copy")
-    print("`captcha_key` out of DevTools -> Network -> the hcaptcha response")
-    print("payload, or from localStorage['captcha_key'].")
+    print("\n" + "=" * 68, flush=True)
+    print("CAPTCHA required (service=%s sitekey=%s)" % (service, sitekey), flush=True)
+    print("Open https://discord.com/captcha , solve it, then copy", flush=True)
+    print("`captcha_key` out of DevTools -> Network -> the hcaptcha response", flush=True)
+    print("payload, or from localStorage['captcha_key'].", flush=True)
     if rqdata:
-        print("rqdata: %s" % rqdata)
-    print("=" * 68)
+        print("rqdata: %s" % rqdata, flush=True)
+    print("=" * 68, flush=True)
 
     for attempt in range(3):
         token = await asyncio.to_thread(
