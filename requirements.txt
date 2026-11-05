@@ -1,0 +1,4 @@
+discord.py-self @ git+https://github.com/dolfies/discord.py-self.git@2ba64a9a997e151a9c259984e0a179b1fdf4aff4
+python-dotenv>=1.0,<2
+tzlocal>=5.0,<6
+aiohttp>=3.9,<4

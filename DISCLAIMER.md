@@ -1,19 +1,14 @@
 # Project Safety and Usage Disclaimer
 
-This repository is a Discord-based OCR and card-recognition utility for identifying anime character cards and related metadata using third-party services (including Discord, OCR providers, and AI/search APIs). It is intended for legitimate, consent-based use with your own accounts and authorized workflows.
+This repository is a Discord user-account client that reads Karuta drop messages and a wishlist evaluator's follow-up message to choose a card reaction. It is intended for legitimate, consent-based use with your own account and authorized workflows.
 
 ## Safety statement
 
 This project is not designed to be malicious software, spyware, malware, or credential-theft tooling. It does not intentionally exfiltrate data, install malware, or perform unauthorized actions outside the configured runtime environment.
 
-However, the project does interact with external services and user credentials, including:
+However, the project interacts with Discord using a user-account token:
 
-- Discord user accounts and API endpoints
-- OCR service APIs
-- AI model providers
-- Web search providers
-
-Because of that, it should only be used in compliance with the terms of service and policies of those providers, along with all applicable local laws and platform rules.
+Discord prohibits automating normal user accounts; using this software may lead to account enforcement, even in a private server. Follow Discord's and third-party services' terms, along with all applicable local laws and platform rules.
 
 ## Responsible use
 
@@ -35,8 +30,8 @@ The author shall not be liable for any direct, indirect, incidental, special, co
 
 ## Public release note
 
-If you plan to make this repository public, it is recommended to keep the project description and README clear that the tool is for legitimate OCR/Discord automation only and that any use must comply with applicable terms and conditions.
+If you plan to make this repository public, keep its description and README clear about the user-account automation and applicable platform restrictions.
 
 ## Recommended wording for the repository description
 
-"Discord OCR utility for anime card recognition. For lawful, authorized use only. Requires API tokens and user account access. Not intended for abuse, spam, or violations of platform terms."
+"Discord wishlist evaluator client for Karuta drops. Requires a Discord user account token. Use only if permitted by Discord's current terms."

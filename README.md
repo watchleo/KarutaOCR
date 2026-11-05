@@ -1,74 +1,110 @@
-# KarutaOCR
+# Karuta Wishlist Evaluator
 
-> **Important: Discord account and Terms of Service warning**
+> **Discord account and Terms of Service warning**
 >
-> This project logs in with a **Discord user-account token** and automates activity
-> on that account, including sending messages and reacting to cards. Discord
-> prohibits automating normal user accounts (self-bots); using this software may
-> violate Discord's Terms of Service and may lead to account action or termination.
-> Do not run it unless Discord's current rules expressly permit your use.
->
-> The human-like delays and typing simulation in this project do **not** make
-> self-bot use compliant, authorized, or undetectable, and are not a means to evade
-> platform enforcement. This notice is informational, not legal advice or a promise
-> that the software is permitted. You are responsible for checking and following
-> the applicable platform terms, laws, and third-party service terms.
+> This project connects with a Discord user-account token through
+> [`discord.py-self`](https://github.com/dolfies/discord.py-self). Discord
+> prohibits automating normal user accounts; use may result in account action
+> or termination. A private server does not change those rules. Use this only
+> if the applicable platform rules permit it.
 
-A Discord self-bot that OCRs character-name screenshots and automatically reacts to selected cards.
+This Python client sends `kd` in configured channels, watches for Karuta drop
+announcements, and reads the configured wishlist evaluator's follow-up message.
+When print numbers are present, it reacts to the card with the lowest print
+number up to 999, skipping the drop if all print numbers exceed 999. If the
+evaluator omits print numbers, it chooses the slot with the highest positive
+wishlist count, breaking ties in favor of the lower slot number. It skips if
+all counts are zero.
 
-## Project status
+Evaluator lines should look like:
 
-This project is unfinished and has not worked reliably as intended; consider it a
-failed experiment rather than a ready-to-use tool. You are welcome to fix, adapt,
-or improve the code. Please review the platform-terms warning above before running
-it, and do not assume that improvements make user-account automation permitted.
+```text
+<:yel_flower:...> <:no_1:...> `♡` `2` · **Character Name** · Series Name
+```
 
-## Setup
+Print-number entries such as `` `#1` · `◈2` `` may appear between the wishlist
+count and character name. The `no_N` number is treated as the original drop
+slot. The evaluator's Discord user ID defaults to `1380936713639166082` and
+can be overridden with `WISHLIST_EVALUATOR_ID`.
 
-1. Create a `.env` file in the project root.
-2. Put your Discord user account token into `DISCORD_USER_TOKEN`.
-3. Add your OCR.Space API key to `OCR_API_KEY`.
-4. Add a Hugging Face access token with Inference Providers access to `HF_TOKEN`. The default model is `Qwen/Qwen3-8B`; set `HF_MODEL` to another chat model available to your account if needed.
-5. Add a Tavily API key to `TAVILY_API_KEY` and/or an Exa API key to `EXA_API_KEY` for web search evidence. Tavily is tried first; Exa is used if Tavily is unavailable or returns no results. Either provider can be used alone.
-6. Optionally add `TARGET_CHANNELS` as a comma-separated list of channel IDs.
-7. Set `DROP_BOT_ID` to the user ID of the bot that announces and posts the card drop.
-8. Optionally set `TEST_MODE_CONTROL_USER_ID` to the ID of the account allowed to toggle test mode by DM. If unset, commands from the logged-in account itself are accepted.
-9. Start the bot:
+The client waits a random 18–85 seconds before its first `kd` command. Later
+commands are scheduled at least 30 minutes apart, with additional timing
+variation. Successful grabs use a 10-minute cooldown; failed or unconfirmed
+grabs use a 75-second cooldown. The command schedule and installation ID are
+saved in `kd-state.json` under `DATA_DIR`.
 
-   ```bash
-   npm install
-   npm start
+## Deploy on Wispbyte
+
+Create a Python worker/bot server, not a web server. Use Python 3.12 if the
+panel offers a Python version selector.
+
+1. Upload `bot.py`, `evaluator.py`, `stealth.py`, `requirements.txt`, and
+   `Procfile` (or deploy the repository).
+2. Install dependencies:
+
+   ```sh
+   python3 -m pip install -r requirements.txt
    ```
 
-   Example `.env`:
+3. Set the startup command to:
 
-   ```env
-   OCR_API_KEY=your_ocr_space_key
-   HF_TOKEN=your_hugging_face_access_token
-   HF_MODEL=Qwen/Qwen3-8B
-   TAVILY_API_KEY=your_tavily_api_key
-   EXA_API_KEY=your_exa_api_key
-   DISCORD_USER_TOKEN=your_discord_user_token
-   TARGET_CHANNELS=123456789012345678
-   DROP_BOT_ID=your_karuta_bot_user_id
-   TEST_MODE_CONTROL_USER_ID=your_control_account_user_id
+   ```sh
+   python3 bot.py
    ```
 
-The user bot sends `kd` no more than once every 30 minutes. After sending `kd`, it waits for a matching `dropping` announcement from `DROP_BOT_ID`, including active-server messages such as `I'm dropping 4 cards since this server is currently active!`. It supports the announcement and image arriving in the same message, and ignores unrelated messages. After a successful emoji grab, it waits 10 minutes before grabbing again. It only reacts after OCR extracts names and the AniList popularity lookup completes.
+4. Configure the environment variables:
 
-OCR.Space positional data groups each horizontal card column and retains its scanned series. AniList matches must agree with both the character name and an associated media title, reducing false matches when unrelated characters share a name. When AniList cannot confidently match every card, the bot fetches Tavily and/or Exa web results and provides their titles and snippets to the configured Hugging Face chat model as evidence. Hugging Face Inference Providers, Tavily, and Exa have account-dependent availability and usage limits. Cards that remain uncertain are skipped; the bot does not react only when none can be evaluated confidently.
+   | Variable | Required | Description |
+   |---|---|---|
+   | `DISCORD_USER_TOKEN` | Yes | Token for the account used by the client |
+   | `TARGET_CHANNELS` | Yes | Comma-separated channel IDs |
+   | `DROP_BOT_ID` | Yes | ID of the bot that posts drop announcements |
+   | `WISHLIST_EVALUATOR_ID` | No | Evaluator ID; defaults to `1380936713639166082` |
+   | `DATA_DIR` | Recommended | Writable persistent directory for state and lock files |
+   | `DISCORD_TIMEZONE` | Recommended | IANA timezone, e.g. `Europe/Berlin` |
 
-When at least one card is confidently evaluated, uncertain cards are skipped and the best eligible card is selected; the bot does not react if every card is uncertain. A card with a print number below 100 takes priority; otherwise, the highest popularity score wins. Send `.teston` or `.testoff` in a DM from the configured control account to enable or disable test mode. Test mode recognizes personal-drop announcements mentioning any user, but the normal grab cooldown still applies; it does not change the scheduled `kd` interval or configured channel and drop-bot checks.
+   Other optional settings are listed in `.env.example`. Keep the token in
+   Wispbyte's private environment settings; do not put it in the startup command
+   or upload a `.env` containing credentials.
 
-The Discord client limits REST requests to 45 per second per running process and logs rate-limit and invalid-request warnings. This does not coordinate other processes using the same account or IP address.
+Use persistent storage for `DATA_DIR` so restarts retain the schedule, and run
+only one copy against the same account and data directory. No port or HTTP
+health check is needed. Check the worker logs for `Connected as ...` to confirm
+login. If a CAPTCHA is presented, the client asks for interactive console
+input; it cannot complete CAPTCHA in a panel without an interactive console.
 
-## Security and credentials
+See [DEPLOYMENT.md](DEPLOYMENT.md) for additional deployment notes.
 
-- Never commit `.env`, account tokens, API keys, or other credentials. `.env` is
-  ignored by Git; copy `.env.example` to `.env` and fill in your own values.
+## Run locally
+
+Python 3.10 or newer is required.
+
+1. Copy `.env.example` to `.env`.
+2. Set `DISCORD_USER_TOKEN`, `TARGET_CHANNELS`, and `DROP_BOT_ID`.
+3. Install dependencies and start the client:
+
+   ```sh
+   python -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r requirements.txt
+   python bot.py
+   ```
+
+   On Windows, activate the virtual environment with
+   `.venv\Scripts\activate` instead.
+
+## Testing
+
+Run the evaluator parser tests with:
+
+```sh
+python -m unittest
+```
+
+## Credentials and security
+
+- Never commit `.env`, account tokens, or other credentials. `.env` is ignored
+  by Git; use `.env.example` as a template.
 - If a credential is exposed, revoke or rotate it with the provider immediately.
-- Do not send credentials in bug reports. See [SECURITY.md](SECURITY.md) for
+- Do not share credentials in bug reports. See [SECURITY.md](SECURITY.md) for
   vulnerability reporting guidance.
-
-This project depends on third-party APIs and libraries. Their terms, availability,
-and data handling policies apply independently of this project's license.

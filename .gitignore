@@ -2,5 +2,11 @@
 .env.*
 !.env.example
 node_modules/
-project_backup.zip
+KarutaOCR.zip
 kd-state.json
+kd-state.json.tmp
+.kd.pid
+__pycache__/
+*.pyc
+.venv/
+venv/
