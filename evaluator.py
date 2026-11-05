@@ -12,7 +12,9 @@ _CARD_LINE = re.compile(
     r"\s*·\s*\*\*(?P<name>.+?)\*\*\s*·\s*(?P<series>.+?)\s*$"
 )
 _EXPIRATION = re.compile(r"<t:(\d+)(?::[tTdDfFR])?>")
-MAX_TARGET_PRINT_NUMBER = 999
+PRINT_PRIORITY_RANGES = ((1, 9), (10, 99), (100, 999))
+MIN_WISHLIST_FOR_PRINTS_100_TO_999 = 1
+MIN_WISHLIST_FOR_PRINTS_1000_PLUS = 7
 
 
 @dataclass(frozen=True)
@@ -73,22 +75,38 @@ def parse_evaluator_message(content: str) -> Evaluation | None:
 
 
 def choose_card(evaluation: Evaluation) -> EvaluatedCard | None:
-    """Prefer the lowest print number up to 999; otherwise use wishlist counts."""
+    """Choose by print-number band, then wishlist count within that band."""
     numbered_cards = [
         card for card in evaluation.cards if card.print_number is not None
     ]
-    if numbered_cards:
+    if not numbered_cards:
+        eligible = [card for card in evaluation.cards if card.wishlist_count > 0]
+        if not eligible:
+            return None
+        return max(eligible, key=lambda card: (card.wishlist_count, -card.slot))
+
+    for lower, upper in PRINT_PRIORITY_RANGES:
         eligible = [
             card
             for card in numbered_cards
             if card.print_number is not None
-            and card.print_number <= MAX_TARGET_PRINT_NUMBER
+            and lower <= card.print_number <= upper
+            and (
+                upper < 100
+                or card.wishlist_count >= MIN_WISHLIST_FOR_PRINTS_100_TO_999
+            )
         ]
-        if not eligible:
-            return None
-        return min(eligible, key=lambda card: (card.print_number, card.slot))
+        if eligible:
+            return max(eligible, key=lambda card: (card.wishlist_count, -card.slot))
 
-    eligible = [card for card in evaluation.cards if card.wishlist_count > 0]
-    if not eligible:
-        return None
-    return max(eligible, key=lambda card: (card.wishlist_count, -card.slot))
+    high_print_cards = [
+        card
+        for card in numbered_cards
+        if card.print_number is not None
+        and card.print_number >= 1000
+        and card.wishlist_count >= MIN_WISHLIST_FOR_PRINTS_1000_PLUS
+    ]
+    if high_print_cards:
+        return max(high_print_cards, key=lambda card: (card.wishlist_count, -card.slot))
+
+    return None
