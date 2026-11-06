@@ -39,6 +39,7 @@ GRAB_FAILURE = re.compile(
     r"\b(?:lost|missed|failed to claim|couldn't claim|could not claim)\b.*\bcard\b",
     re.I,
 )
+HEART_HINT = re.compile(r"[\u2661\u2665\u2764]")
 
 # Timing is always a range, never a constant.
 COMMAND_INTERVAL_SECONDS = 30 * 60
@@ -52,6 +53,9 @@ TYPING_SECONDS = (1.1, 2.9)
 REACTION_DELAY_SECONDS = (0.07, 0.22)
 PENDING_DROP_TTL_SECONDS = 180
 EVALUATOR_SETTLE_SECONDS = 3.0
+# An empty evaluator message is usually a placeholder that gets edited moments
+# later; re-fetch it on this schedule so a missed edit does not lose the drop.
+EVALUATOR_REFETCH_DELAYS = (4.0, 5.0, 7.0)
 SKIP_CHANCE = 0.02
 MAX_MESSAGE_ATTEMPTS = 3
 LOCK_RETRY_ATTEMPTS = 5
@@ -86,6 +90,7 @@ class PendingDrop:
     card_message: discord.Message | None = None
     evaluation: Evaluation | None = None
     evaluation_processed: bool = False
+    announced_at: float = 0.0
 
 
 @dataclass
@@ -257,6 +262,7 @@ class KarutaClient(discord.Client):
         self._claim_lock = asyncio.Lock()
         self._seen_announcements: deque[int] = deque(maxlen=256)
         self._ready_count = 0
+        self._hinted_foreign_evaluator = False
         self._presence = PresenceRotator(self, config.profile.activity_pool)
         self._close_requested = False
         try:
@@ -475,6 +481,7 @@ class KarutaClient(discord.Client):
             announcement_id=message.id,
             expires_at=message.created_at.timestamp() + CLAIM_WINDOW_SECONDS,
             card_message=message if _is_image_message(message) else None,
+            announced_at=message.created_at.timestamp(),
         )
         log.info("Drop announced in %s.", message.channel.id)
 
@@ -506,29 +513,127 @@ class KarutaClient(discord.Client):
             return
         pending = self.pending_drops.get(message.channel.id)
         if pending is None or pending.evaluation_processed:
+            if pending is None:
+                log.info(
+                    "Evaluator message %s ignored: no pending drop in channel %s "
+                    "(was the drop announcement detected?).",
+                    getattr(message, "id", "?"),
+                    message.channel.id,
+                )
             return
         if message.created_at.timestamp() > pending.expires_at:
+            log.info(
+                "Evaluator message %s arrived after the claim window; drop discarded.",
+                getattr(message, "id", "?"),
+            )
             self.pending_drops.pop(message.channel.id, None)
+            return
+        if (
+            pending.announced_at
+            and message.created_at.timestamp() + 5.0 < pending.announced_at
+        ):
+            # An edit to an evaluator message from a PREVIOUS drop (for example
+            # the bot marking it as expired) must not feed the current drop.
+            log.info(
+                "Evaluator message %s predates the current drop announcement; "
+                "ignoring its edit.",
+                getattr(message, "id", "?"),
+            )
             return
 
         message_text = _message_text(message)
+        log.info(
+            "Evaluator message %s settled (embeds=%d, chars=%d).",
+            getattr(message, "id", "?"),
+            len(message.embeds),
+            len(message_text),
+        )
         evaluation = parse_evaluator_message(message_text)
         if evaluation is None:
-            log.warning(
-                "Evaluator output had no parseable entries "
-                "(author_id=%s message_id=%s embeds=%d): %r",
-                message.author.id,
-                message.id,
-                len(message.embeds),
-                message_text,
-            )
-            return
+            evaluation = await self._recover_evaluator_message(message, message_text)
+            if evaluation is None:
+                return
 
         pending.evaluation = evaluation
         if evaluation.expires_at is not None:
             pending.expires_at = min(pending.expires_at, float(evaluation.expires_at))
 
         await self._process_pending_drop(message.channel.id, pending)
+
+    async def _recover_evaluator_message(
+        self, message: discord.Message, message_text: str
+    ) -> Evaluation | None:
+        """Recover or diagnose an evaluator message the parser could not read.
+
+        Empty messages are usually placeholders that get edited moments later;
+        re-fetch them from the API so a missed edit does not lose the drop.
+        Messages that look like an analysis (hearts or wishlist hints) but do
+        not parse are real format problems and stay warnings; anything else
+        is an unrelated notice from the same bot (ping, tip, expiry note) and
+        is only logged for info.
+        """
+        message_id = getattr(message, "id", None)
+
+        if not message_text.strip() and not message.embeds:
+            log.info(
+                "Evaluator message %s is empty (probably a placeholder); "
+                "re-fetching to catch the edited version.",
+                message_id if message_id is not None else "?",
+            )
+            channel = message.channel
+            if message_id is None or not hasattr(channel, "fetch_message"):
+                return None
+            for delay in EVALUATOR_REFETCH_DELAYS:
+                await asyncio.sleep(delay)
+                current = self.pending_drops.get(message.channel.id)
+                if current is None or current.evaluation_processed:
+                    return None
+                try:
+                    fresh = await channel.fetch_message(message_id)
+                except discord.HTTPException as error:
+                    log.warning(
+                        "Re-fetch of evaluator message %s failed: %s",
+                        message_id,
+                        error,
+                    )
+                    return None
+                fresh_text = _message_text(fresh)
+                evaluation = parse_evaluator_message(fresh_text)
+                if evaluation is not None:
+                    log.info(
+                        "Evaluator message %s became parseable after a re-fetch "
+                        "(embeds=%d, chars=%d).",
+                        message_id,
+                        len(fresh.embeds),
+                        len(fresh_text),
+                    )
+                    return evaluation
+            log.info(
+                "Evaluator message %s was still empty after %d re-fetches.",
+                message_id,
+                len(EVALUATOR_REFETCH_DELAYS),
+            )
+            return None
+
+        author = getattr(message, "author", None)
+        author_id = getattr(author, "id", "?")
+        if HEART_HINT.search(message_text) or "wish" in message_text.lower():
+            log.warning(
+                "Evaluator output looks like an analysis but had no parseable "
+                "entries (author_id=%s message_id=%s embeds=%d): %s",
+                author_id,
+                message_id,
+                len(message.embeds),
+                repr(message_text)[:400],
+            )
+        else:
+            log.info(
+                "Evaluator message %s has no card lines (likely a ping or "
+                "notice from the same bot, not the drop analysis): %s",
+                message_id,
+                repr(message_text)[:160],
+            )
+        return None
 
     def _schedule_evaluator_message(self, message: discord.Message) -> None:
         task = self._evaluator_tasks.get(message.id)
@@ -559,28 +664,47 @@ class KarutaClient(discord.Client):
         evaluation = pending.evaluation
         if self.pending_drops.get(channel_id) is not pending:
             return
-        if pending.evaluation_processed or evaluation is None:
+        if pending.evaluation_processed:
+            return
+        if evaluation is None:
             return
         if pending.card_message is None:
-            log.info("Evaluator output ready in %s; waiting for the drop image.", channel_id)
+            log.info(
+                "Evaluation ready in channel %s; still waiting for the drop image.",
+                channel_id,
+            )
             return
 
         pending.evaluation_processed = True
         chosen = choose_card(evaluation)
         if chosen is None:
-            candidates = "; ".join(
-                f"slot {card.slot}: {card.name} "
-                f"(wishlist={card.wishlist_count}, print=#{card.print_number})"
-                for card in evaluation.cards
+            log.warning(
+                "Skipping drop in channel %s - no eligible card among: %s.",
+                channel_id,
+                "; ".join(
+                    "slot %d (\u2661%s%s, %s)"
+                    % (
+                        card.slot,
+                        card.wishlist_count,
+                        f" #{card.print_number}"
+                        if card.print_number is not None
+                        else "",
+                        card.name,
+                    )
+                    for card in evaluation.cards
+                ),
             )
-            log.warning("No eligible card in evaluator output: %s", candidates)
             return
         if time.time() >= pending.expires_at:
             return
 
         emoji = REACTION_EMOJIS[chosen.slot - 1]
         log.info(
-            "Slot %s -> %s (%s matches).", chosen.slot, chosen.name, chosen.wishlist_count
+            "Slot %s -> %s (\u2661%s%s).",
+            chosen.slot,
+            chosen.name,
+            chosen.wishlist_count,
+            f", #{chosen.print_number}" if chosen.print_number is not None else "",
         )
         await self._claim_card(pending.card_message, emoji, pending.expires_at)
 
@@ -662,6 +786,21 @@ class KarutaClient(discord.Client):
             return
 
         if message.author.id != self.config.drop_bot_id:
+            if (
+                not self._hinted_foreign_evaluator
+                and getattr(message.author, "bot", False)
+                and HEART_HINT.search(_message_text(message))
+            ):
+                self._hinted_foreign_evaluator = True
+                log.warning(
+                    "Message from author %s looks like an evaluation but matches "
+                    "neither WISHLIST_EVALUATOR_ID=%s nor DROP_BOT_ID=%s; copy the "
+                    "evaluator bot's ID (right-click it in Discord -> Copy User ID) "
+                    "and set WISHLIST_EVALUATOR_ID.",
+                    message.author.id,
+                    self.config.evaluator_bot_id,
+                    self.config.drop_bot_id,
+                )
             return
 
         if self.pending_grab is not None:
@@ -692,6 +831,27 @@ class KarutaClient(discord.Client):
 
         if after.author.id == self.config.evaluator_bot_id:
             self._schedule_evaluator_message(after)
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        """Catch evaluator edits for messages that fell out of the cache."""
+        author = payload.data.get("author") or {}
+        try:
+            author_id = int(author.get("id", ""))
+        except (TypeError, ValueError):
+            return
+        if author_id != self.config.evaluator_bot_id:
+            return
+        if payload.message_id in self._evaluator_tasks:
+            # The cached path (on_message_edit) already rescheduled it.
+            return
+        channel = self.get_channel(payload.channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        self._schedule_evaluator_message(message)
 
 
 def main() -> None:

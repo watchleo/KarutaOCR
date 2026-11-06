@@ -11,16 +11,15 @@
 This Python client sends `kd` in configured channels, watches for Karuta drop
 announcements, and reads the configured wishlist evaluator's follow-up message.
 It waits three seconds after the evaluator's latest message edit before parsing,
-so intermediate embed updates can settle. When print numbers are present, it
-prioritizes print ranges 1–9, 10–99, then 100–999, choosing the highest
-wishlist count within the best eligible range. Prints 1–99 are always eligible;
-prints 100–999 require at least one wishlist. Prints 1000+ are eligible only
-with at least seven wishlists. Ties go to the lower slot number. If the
-evaluator omits print numbers, it chooses the slot with the highest positive
-wishlist count. If every reported print is above 999 and none meets the
-seven-wishlist threshold, it falls back to the highest positive wishlist count
-(`FALLBACK_TO_WISHLIST` in `evaluator.py`, enabled by default). It skips if no
-card qualifies.
+so intermediate embed updates can settle. An empty evaluator message is
+re-fetched a few times in case the analysis is edited in moments later, and
+messages from earlier drops cannot be matched to the current one.
+When print numbers are present, it reacts to the card with the lowest print
+number up to 999. If every print number exceeds 999, it falls back to the
+highest positive wishlist count; set `FALLBACK_TO_WISHLIST = False` in
+`evaluator.py` to skip such drops instead. If the evaluator omits print
+numbers, it chooses the slot with the highest positive wishlist count, breaking
+ties in favor of the lower slot number. It skips if all counts are zero.
 
 Evaluator lines should look like:
 

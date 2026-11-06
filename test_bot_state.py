@@ -186,7 +186,7 @@ class BotStateTests(unittest.TestCase):
         client = object.__new__(KarutaClient)
         client.config = SimpleNamespace(target_channels=(channel_id,))
         client.pending_drops = {channel_id: pending}
-        message_text = "Unexpected evaluator format"
+        message_text = "Unexpected ♡ evaluator format"
         embeds = [
             SimpleNamespace(
                 title=None,
@@ -210,13 +210,103 @@ class BotStateTests(unittest.TestCase):
             )
 
         log_warning.assert_called_once_with(
-            "Evaluator output had no parseable entries "
-            "(author_id=%s message_id=%s embeds=%d): %r",
+            "Evaluator output looks like an analysis but had no parseable "
+            "entries (author_id=%s message_id=%s embeds=%d): %s",
             456,
             789,
             1,
-            message_text,
+            repr(message_text)[:400],
         )
+        self.assertIsNone(pending.evaluation)
+
+    def test_notice_evaluator_message_is_not_a_warning(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        evaluator_message = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content="A drop ping went out to 3 users.",
+            embeds=[],
+        )
+
+        with patch("bot.log.warning") as log_warning:
+            asyncio.run(
+                KarutaClient._handle_evaluator_message(client, evaluator_message)
+            )
+
+        log_warning.assert_not_called()
+        self.assertIsNone(pending.evaluation)
+
+    def test_empty_evaluator_message_is_refetched_until_parseable(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        placeholder = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content="",
+            embeds=[],
+        )
+        filled = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
+            channel=placeholder.channel,
+            created_at=now,
+            content="<:no_1:1> `♡` `2` · **First** · Series",
+            embeds=[],
+        )
+        placeholder.channel.fetch_message = AsyncMock(return_value=filled)
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient._handle_evaluator_message(client, placeholder)
+
+        asyncio.run(exercise())
+
+        placeholder.channel.fetch_message.assert_awaited_with(789)
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[0].name, "First")
+        self.assertFalse(pending.evaluation_processed)
+
+    def test_stale_evaluator_edit_cannot_feed_current_drop(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        stale_edit = SimpleNamespace(
+            id=789,
+            author=SimpleNamespace(id=456),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now - timedelta(hours=1),
+            content="<:no_1:1> `♡` `2` · **First** · Series",
+            embeds=[],
+        )
+
+        asyncio.run(KarutaClient._handle_evaluator_message(client, stale_edit))
+
         self.assertIsNone(pending.evaluation)
 
     def test_evaluator_edit_is_processed(self) -> None:
@@ -311,55 +401,6 @@ class BotStateTests(unittest.TestCase):
         claim.assert_awaited_once_with(
             image_message, "1\ufe0f\u20e3", pending.expires_at
         )
-
-    def test_evaluator_waiting_for_drop_image_is_logged(self) -> None:
-        channel_id = 123
-        pending = PendingDrop(
-            announcement_id=1,
-            expires_at=(datetime.now(timezone.utc) + timedelta(seconds=59)).timestamp(),
-            evaluation=SimpleNamespace(cards=(), expires_at=None),
-        )
-        client = object.__new__(KarutaClient)
-        client.pending_drops = {channel_id: pending}
-
-        with patch("bot.log.info") as log_info:
-            asyncio.run(KarutaClient._process_pending_drop(client, channel_id, pending))
-
-        log_info.assert_called_once_with(
-            "Evaluator output ready in %s; waiting for the drop image.", channel_id
-        )
-        self.assertFalse(pending.evaluation_processed)
-
-    def test_ineligible_cards_are_logged_with_wishlist_and_print(self) -> None:
-        channel_id = 123
-        now = datetime.now(timezone.utc)
-        pending = PendingDrop(
-            announcement_id=1,
-            expires_at=(now + timedelta(seconds=59)).timestamp(),
-            card_message=SimpleNamespace(),
-            evaluation=SimpleNamespace(
-                cards=(
-                    SimpleNamespace(
-                        slot=1, name="First", wishlist_count=0, print_number=85233
-                    ),
-                ),
-                expires_at=None,
-            ),
-        )
-        client = object.__new__(KarutaClient)
-        client.pending_drops = {channel_id: pending}
-
-        with (
-            patch("bot.choose_card", return_value=None),
-            patch("bot.log.warning") as log_warning,
-        ):
-            asyncio.run(KarutaClient._process_pending_drop(client, channel_id, pending))
-
-        log_warning.assert_called_once_with(
-            "No eligible card in evaluator output: %s",
-            "slot 1: First (wishlist=0, print=#85233)",
-        )
-        self.assertTrue(pending.evaluation_processed)
 
 
 if __name__ == "__main__":

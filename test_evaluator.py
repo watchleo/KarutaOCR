@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest import mock
 
 from evaluator import choose_card, parse_evaluator_message
 
@@ -43,29 +43,28 @@ class EvaluatorMessageTests(unittest.TestCase):
         assert chosen is not None
         self.assertEqual((chosen.slot, chosen.name), (2, "Second"))
 
-    def test_prioritizes_best_print_range_then_highest_wishlist_count(self) -> None:
+    def test_prefers_lowest_print_number_at_or_below_999(self) -> None:
         evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `2` · `#10` · `◈3` · **Lower wishes** · Series\n"
-            "<:no_2:2> `♡` `10` · `#90` · `◈2` · **Higher wishes** · Series\n"
-            "<:no_3:3> `♡` `68` · `#1000` · `◈1` · **Higher range** · Series"
+            "<:no_1:1> `♡` `27` · `#2792` · `◈3` · **Higher** · Series\n"
+            "<:no_2:2> `♡` `0` · `#1` · `◈2` · **Lowest** · Series\n"
+            "<:no_3:3> `♡` `1` · `#999` · `◈1` · **Boundary** · Series"
         )
 
         self.assertIsNotNone(evaluation)
         assert evaluation is not None
         self.assertEqual(
             [card.print_number for card in evaluation.cards],
-            [10, 90, 1000],
+            [2792, 1, 999],
         )
         chosen = choose_card(evaluation)
         self.assertIsNotNone(chosen)
         assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (2, "Higher wishes"))
+        self.assertEqual((chosen.slot, chosen.name), (2, "Lowest"))
 
-    def test_prints_1_to_9_are_eligible_even_without_wishlists(self) -> None:
+    def test_falls_back_to_wishlist_when_all_print_numbers_exceed_999(self) -> None:
         evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `0` · `#9` · `◈3` · **High wish count** · Series\n"
-            "<:no_2:2> `♡` `0` · `#1` · `◈1` · **Low print** · Series\n"
-            "<:no_3:3> `♡` `68` · `#100` · `◈1` · **Lower priority** · Series"
+            "<:no_1:1> `♡` `27` · `#2792` · `◈3` · **Higher** · Series\n"
+            "<:no_2:2> `♡` `1` · `#1000` · `◈1` · **Next** · Series"
         )
 
         self.assertIsNotNone(evaluation)
@@ -73,80 +72,58 @@ class EvaluatorMessageTests(unittest.TestCase):
         chosen = choose_card(evaluation)
         self.assertIsNotNone(chosen)
         assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (1, "High wish count"))
+        self.assertEqual((chosen.slot, chosen.name), (1, "Higher"))
 
-    def test_prints_10_to_99_beat_higher_ranges_and_use_wishlist_count(self) -> None:
+    def test_strict_mode_skips_when_all_print_numbers_exceed_999(self) -> None:
         evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `1` · `#10` · `◈1` · **First** · Series\n"
-            "<:no_2:2> `♡` `8` · `#99` · `◈1` · **Most wished** · Series\n"
-            "<:no_3:3> `♡` `68` · `#100` · `◈1` · **Higher range** · Series"
+            "<:no_1:1> `♡` `27` · `#2792` · `◈3` · **Higher** · Series\n"
+            "<:no_2:2> `♡` `1` · `#1000` · `◈1` · **Next** · Series"
         )
 
         self.assertIsNotNone(evaluation)
         assert evaluation is not None
-        chosen = choose_card(evaluation)
-        self.assertIsNotNone(chosen)
-        assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (2, "Most wished"))
-
-    def test_prints_100_to_999_require_wishlist_and_pick_highest_count(self) -> None:
-        evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `0` · `#100` · `◈1` · **No wishes** · Series\n"
-            "<:no_2:2> `♡` `3` · `#999` · `◈1` · **Some wishes** · Series\n"
-            "<:no_3:3> `♡` `7` · `#1000` · `◈1` · **Higher range** · Series"
-        )
-
-        self.assertIsNotNone(evaluation)
-        assert evaluation is not None
-        chosen = choose_card(evaluation)
-        self.assertIsNotNone(chosen)
-        assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (2, "Some wishes"))
-
-    def test_prints_1000_plus_fall_back_to_wishlist_counts(self) -> None:
-        below_threshold = parse_evaluator_message(
-            "<:no_1:1> `♡` `6` · `#1000` · `◈1` · **Below threshold** · Series\n"
-            "<:no_2:2> `♡` `2` · `#10000` · `◈1` · **Also below** · Series"
-        )
-        at_threshold = parse_evaluator_message(
-            "<:no_1:1> `♡` `6` · `#1000` · `◈1` · **Below threshold** · Series\n"
-            "<:no_2:2> `♡` `7` · `#10000` · `◈1` · **At threshold** · Series"
-        )
-
-        self.assertIsNotNone(below_threshold)
-        self.assertIsNotNone(at_threshold)
-        assert below_threshold is not None
-        assert at_threshold is not None
-        chosen = choose_card(below_threshold)
-        self.assertIsNotNone(chosen)
-        assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (1, "Below threshold"))
-        chosen = choose_card(at_threshold)
-        self.assertIsNotNone(chosen)
-        assert chosen is not None
-        self.assertEqual((chosen.slot, chosen.name), (2, "At threshold"))
-
-    def test_high_print_wishlist_fallback_can_be_disabled(self) -> None:
-        evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `2` · `#85260` · **Shuu Maiko** · Nisekoi"
-        )
-
-        self.assertIsNotNone(evaluation)
-        assert evaluation is not None
-        with patch("evaluator.FALLBACK_TO_WISHLIST", False):
+        with mock.patch("evaluator.FALLBACK_TO_WISHLIST", False):
             self.assertIsNone(choose_card(evaluation))
 
-    def test_cardcompanion_high_print_drop_selects_most_wished_card(self) -> None:
+    def test_skips_when_all_prints_high_and_all_counts_zero(self) -> None:
         evaluation = parse_evaluator_message(
-            "<:no_1:1> `♡` `0` · `#85233` · **Kouichiro Kase** · Knight Hunters\n"
-            "<:no_2:2> `♡` `2` · `#85260` · **Shuu Maiko** · Nisekoi\n"
-            "<:no_3:3> `♡` `1` · `#13514` · **VISCO** · Marvel Future Avengers\n"
-            "Drop expires <t:1793755181:R>."
+            "<:no_1:1> `♡` `0` · `#2792` · **First** · Series\n"
+            "<:no_2:2> `♡` `0` · `#1000` · **Second** · Series"
         )
 
         self.assertIsNotNone(evaluation)
         assert evaluation is not None
-        self.assertEqual(evaluation.expires_at, 1793755181)
+        self.assertIsNone(choose_card(evaluation))
+
+    def test_parses_real_cardcompanion_drop_with_footer_lines(self) -> None:
+        """Exact message observed in production, including -# subtext lines."""
+        message = "\n".join(
+            (
+                "<:yel_flower:1382527541130170538> <:no_1:1382526208822083727> `♡` `0` · `#85233` · `◈1` · **Kouichiro Kase** · Knight Hunters",
+                "<:yel_flower:1382527541130170538> <:no_2:1382526232914296912> `♡` `2` · `#85260` · `◈1` · **Shuu Maiko** · Nisekoi",
+                "<:yel_flower:1382527541130170538> <:no_3:1382526252312825887> `♡` `1` · `#13514` · `◈1` · **VISCO** · Marvel Future Avengers",
+                "Drop expires <t:1793921154:R>.",
+                "-# Drop time: 125ms search time: 0.02ms",
+                "-# Tip: Remove characters from your wishlist by using `c!wishremove`",
+            )
+        )
+
+        evaluation = parse_evaluator_message(message)
+
+        self.assertIsNotNone(evaluation)
+        assert evaluation is not None
+        self.assertEqual(evaluation.expires_at, 1793921154)
+        self.assertEqual(
+            [
+                (card.slot, card.wishlist_count, card.print_number, card.name)
+                for card in evaluation.cards
+            ],
+            [
+                (1, 0, 85233, "Kouichiro Kase"),
+                (2, 2, 85260, "Shuu Maiko"),
+                (3, 1, 13514, "VISCO"),
+            ],
+        )
         chosen = choose_card(evaluation)
         self.assertIsNotNone(chosen)
         assert chosen is not None
