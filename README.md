@@ -9,17 +9,34 @@
 > if the applicable platform rules permit it.
 
 This Python client sends `kd` in configured channels, watches for Karuta drop
-announcements, and reads the configured wishlist evaluator's follow-up message.
-It waits three seconds after the evaluator's latest message edit before parsing,
-so intermediate embed updates can settle. An empty evaluator message is
-re-fetched a few times in case the analysis is edited in moments later, and
-messages from earlier drops cannot be matched to the current one.
-When print numbers are present, it reacts to the card with the lowest print
-number up to 999. If every print number exceeds 999, it falls back to the
-highest positive wishlist count; set `FALLBACK_TO_WISHLIST = False` in
-`evaluator.py` to skip such drops instead. If the evaluator omits print
-numbers, it chooses the slot with the highest positive wishlist count, breaking
-ties in favor of the lower slot number. It skips if all counts are zero.
+announcements, and reads the wishlist evaluator's follow-up analysis. The
+analysis is detected **by its content** (a `Drop expires <t:...>` line, or
+card lines such as `` `♡` `2` · `#85233` · `◈1` ``) no matter which account
+posted it — including your own account (self-bot evaluators) or another bot.
+The configured `WISHLIST_EVALUATOR_ID` is still honoured as an additional
+trigger. **Components V2 messages** — where the text lives in Text Display
+components and `content` is empty, which discord.py-self versions without
+V2 support read as a completely empty message — are re-read through the raw
+REST payload so the analysis is not lost. `MESSAGE_UPDATE` edits are settled
+straight from the gateway payload (the freshest copy, before any fetch), and
+a raw fetch that misses — `http.get_message` uses `?limit=1&around=`, which
+can skip a message that is still the newest in the channel — falls back to a
+deterministic `?before=` history window. Content-detected analyses are
+acted on after a 0.6 s settle; messages from the configured evaluator bot
+keep the 3 s settle, and empty messages are re-fetched from the API in case
+their content lands via an edit. Analyses whose expiry timestamp is more
+than 30 s in the past (quotes or stale edits) are ignored, while a fresh
+expiry accepts a message that predates the announcement (evaluators that
+reuse one persistent message per channel). Karuta drop images are accepted
+both as attachments and as embed images, and **every** card message of a drop
+is tracked (Karuta posts one message per card), so slot *N* of the analysis
+grabs the *N*-th card message. When print numbers are present, it grabs the
+card with the lowest print number up to 999. If every print
+number exceeds 999, it falls back to the highest positive wishlist count;
+set `FALLBACK_TO_WISHLIST = False` in `evaluator.py` to skip such drops
+instead. If the evaluator omits print numbers, it chooses the slot with the
+highest positive wishlist count, breaking ties in favor of the lower slot
+number. It skips if all counts are zero.
 
 Evaluator lines should look like:
 
@@ -30,7 +47,83 @@ Evaluator lines should look like:
 Print-number entries such as `` `#1` · `◈2` `` may appear between the wishlist
 count and character name. The `no_N` number is treated as the original drop
 slot. The evaluator's Discord user ID defaults to `1380936713639166082` and
-can be overridden with `WISHLIST_EVALUATOR_ID`.
+can be overridden with `WISHLIST_EVALUATOR_ID`; with content-based detection
+the ID no longer has to be correct for the bot to see the analysis.
+
+## How the grab works
+
+Grabbing a card in Karuta is an **emoji reaction on the card message**, not a
+button click. Karuta pre-adds the grab emoji to every card message it drops,
+so the bot reads the emoji straight from the message it is about to react to:
+
+1. `KARUTA_GRAB_EMOJI` (optional `.env` setting) always wins when set —
+   paste the emoji exactly as `<:name:id>` / `<a:name:id>` for a custom
+   emoji, or a plain unicode emoji.
+2. Otherwise the first **non-number** reaction already on the chosen card
+   message is used — that is Karuta's own grab emoji. Number keycaps are
+   skipped because they mark slot picks, not the grab.
+3. If the message arrived before Karuta added the emoji (its reaction list
+   is empty), a fresh REST copy of the message is read, and — still empty —
+   the bot waits up to 15 s for the emoji to appear live.
+4. Last resort: the slot's number keycap (`1️⃣`–`4️⃣`), for servers where
+   cards are picked with numbered reactions.
+
+The previous release reacted with the slot's number keycap and then waited
+for **another player** to add that same number first — which never happens —
+so every grab silently expired with "`2️⃣ never appeared.`" and the bot gave
+up without reacting. That gate is gone: the bot reacts as soon as the
+analysis and the card messages are both ready. If the evaluation arrives
+before all card messages, a short 2 s grace lets the rest arrive before
+falling back to the closest tracked message.
+
+## Reading the logs
+
+While a drop is pending, every message in a watched channel is traced:
+
+```text
+[watch:create] id=1004 author=1568054352600506440 bot=True ... flags=32768 v2=True embeds=0 attachments=0 components=0 chars=0 preview=''
+Evaluator message 1004 keeps its text in components (Components V2); read 340 chars via the raw API.
+Evaluator message 1004 settled (author; author=1568054352600506440 embeds=0 chars=340): '<:yel_flower:1> ...'
+Slot 2 -> Shou Daliuwan (♡1, #18481).
+Reacted <:kx:987654321> to 1002 (slot 2, emoji from reactions on the card message); awaiting confirmation.
+```
+
+- `[watch:...]` shows who sent each message and exactly what the bot could
+  read from it (`chars` = text length, `v2=True` = Components V2 message).
+  `chars=0` with `v2=True` is the signature of an analysis whose text lives
+  in components: the bot reads it via the raw API. `chars=0` with `v2=False`
+  from your own account means the message really arrived empty — the
+  re-fetch paths cover a late edit.
+- `Wishlist analysis detected from author ...` is printed whenever a message
+  matches the analysis format, regardless of author — including your own
+  account (self-bot evaluators).
+- `settled (content; ...)` / `settled (author; ...)` / `settled (components; ...)`
+  / `settled (recheck; ...)` tell you why a message was treated as evaluator
+  output: content match, configured bot ID, Components V2 flag, or an
+  empty-message re-fetch.
+- `keeps its text in components ... read N chars via the raw API` confirms
+  the V2 fallback recovered a message the library itself cannot parse.
+- `[watch:edit-raw]` traces the raw `MESSAGE_UPDATE` payload of every edit in
+  a watched channel — if a drop is still missed, this line shows exactly
+  what the gateway delivered and from which author.
+- `Raw fetch of message ... failed ...; trying a history window.` means the
+  one-message lookup missed and the bot re-read the message from a
+  `?before=` window instead; the drop is not lost either way.
+- `Drop image received in <channel> (N tracked)` counts the card messages of
+  the drop; slot N of the analysis grabs the N-th one.
+- `Reacted <emoji> to <message> (slot N, emoji from <source>)` names the
+  exact emoji used and where it came from (`reactions on the card message`,
+  `reactions in a fresh REST copy`, `live reaction (...)`,
+  `KARUTA_GRAB_EMOJI override`, or `slot keycap fallback`). If it ever picks
+  the wrong emoji, set `KARUTA_GRAB_EMOJI` in `.env` to the exact emoji
+  shown under the card in Discord.
+- `Evaluation ready in channel ...; N of M card message(s) tracked; waiting
+  up to 2.0s for the rest.` means the analysis beat some card messages to
+  the bot; the grab fires once the rest arrive (or right after the grace).
+- `Re-fetch N/M of message ...: author=... edited=... chars=...` shows what
+  each empty-message re-fetch actually returned — author, whether the
+  message had been edited, the text length and a preview — so a
+  still-empty analysis is diagnosable from the log alone.
 
 The client waits a random 18–85 seconds before its first `kd` command. Later
 commands are scheduled at least 30 minutes apart, with additional timing
@@ -78,6 +171,7 @@ member caching are disabled by default to limit memory use.
    | Variable | Required | Description |
    |---|---|---|
    | `WISHLIST_EVALUATOR_ID` | No | Evaluator ID; defaults to `1380936713639166082` |
+   | `KARUTA_GRAB_EMOJI` | No | Hard-code the grab emoji (e.g. `<:kx:123>` or 💜); by default it is read from the chosen card message's own reactions |
    | `DATA_DIR` | Recommended | Writable persistent directory for state and lock files |
    | `DISCORD_TIMEZONE` | Recommended | Your own IANA timezone; set it explicitly if the container reports UTC |
    | `CAPTCHA_KEY` | No | Operator-supplied, single-use CAPTCHA response; if unset or already used, the process waits before exiting when challenged |

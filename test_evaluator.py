@@ -129,6 +129,42 @@ class EvaluatorMessageTests(unittest.TestCase):
         assert chosen is not None
         self.assertEqual((chosen.slot, chosen.name), (2, "Shuu Maiko"))
 
+    def test_parses_real_cardcompanion_drop_with_rotating_tip(self) -> None:
+        """A second production capture: different tip line, '!' in series name."""
+        message = "\n".join(
+            (
+                "<:yel_flower:1382527541130170538> <:no_1:1382526208822083727> `♡` `0` · `#85143` · `◈1` · **Queen Mirage** · Happiness Charge Precure!",
+                "<:yel_flower:1382527541130170538> <:no_2:1382526232914296912> `♡` `1` · `#18481` · `◈2` · **Shou Daliuwan** · Scissor Seven",
+                "<:yel_flower:1382527541130170538> <:no_3:1382526252312825887> `♡` `0` · `#85334` · `◈1` · **Gingar** · Ozanari Dungeon",
+                "Drop expires <t:1793927620:R>.",
+                "-# Drop time: 125ms search time: 0.02ms",
+                "-# Tip: Want drop embeds to only show for good cards? Configure a channel override in the **General & Misc Config** category of `/config karuta view`",
+            )
+        )
+
+        evaluation = parse_evaluator_message(message)
+
+        self.assertIsNotNone(evaluation)
+        assert evaluation is not None
+        self.assertEqual(evaluation.expires_at, 1793927620)
+        self.assertEqual(
+            [
+                (card.slot, card.wishlist_count, card.print_number, card.name, card.series)
+                for card in evaluation.cards
+            ],
+            [
+                (1, 0, 85143, "Queen Mirage", "Happiness Charge Precure!"),
+                (2, 1, 18481, "Shou Daliuwan", "Scissor Seven"),
+                (3, 0, 85334, "Gingar", "Ozanari Dungeon"),
+            ],
+        )
+        # All prints exceed 999, so the wishlist fallback picks the only
+        # wished card: Shou Daliuwan (slot 2).
+        chosen = choose_card(evaluation)
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual((chosen.slot, chosen.name), (2, "Shou Daliuwan"))
+
     def test_skips_when_all_wishlist_counts_are_zero(self) -> None:
         evaluation = parse_evaluator_message(
             "<:no_1:1> `♡` `0` · **First** · Series\n"

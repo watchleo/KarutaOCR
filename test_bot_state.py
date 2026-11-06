@@ -1,12 +1,38 @@
 import asyncio
+import discord
 from datetime import datetime, timedelta, timezone
 import os
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from bot import KarutaClient, PendingDrop, _acquire_guard, load_config
+from bot import (
+    IS_COMPONENTS_V2_FLAG,
+    KarutaClient,
+    PendingDrop,
+    _acquire_guard,
+    _first_non_number_emoji,
+    _first_non_number_emoji_raw,
+    _is_image_message,
+    _looks_like_evaluator_output,
+    _text_from_raw,
+    load_config,
+)
 from stealth import CaptchaRequired, console_captcha_handler
+
+
+def _analysis_content(expires_in: int = 50) -> str:
+    """A real CardCompanion-style analysis with a controllable expiry."""
+    expiry = int(time.time() + expires_in)
+    return (
+        "<:yel_flower:1382527541130170538> <:no_1:1382526208822083727> `♡` `0` · `#85143` · `◈1` · **Queen Mirage** · Happiness Charge Precure!\n"
+        "<:yel_flower:1382527541130170538> <:no_2:1382526232914296912> `♡` `1` · `#18481` · `◈2` · **Shou Daliuwan** · Scissor Seven\n"
+        "<:yel_flower:1382527541130170538> <:no_3:1382526252312825887> `♡` `0` · `#85334` · `◈1` · **Gingar** · Ozanari Dungeon\n"
+        f"Drop expires <t:{expiry}:R>.\n"
+        "-# Drop time: 125ms search time: 0.02ms\n"
+        "-# Tip: Want drop embeds to only show for good cards? Configure a channel override in the **General & Misc Config** category of `/config karuta view`"
+    )
 
 
 class BotStateTests(unittest.TestCase):
@@ -256,6 +282,15 @@ class BotStateTests(unittest.TestCase):
         client = object.__new__(KarutaClient)
         client.config = SimpleNamespace(target_channels=(channel_id,))
         client.pending_drops = {channel_id: pending}
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(
+                return_value={
+                    "id": 789,
+                    "content": "<:no_1:1> `♡` `2` · **First** · Series",
+                    "embeds": [],
+                }
+            )
+        )
         placeholder = SimpleNamespace(
             id=789,
             author=SimpleNamespace(id=456),
@@ -264,15 +299,6 @@ class BotStateTests(unittest.TestCase):
             content="",
             embeds=[],
         )
-        filled = SimpleNamespace(
-            id=789,
-            author=SimpleNamespace(id=456),
-            channel=placeholder.channel,
-            created_at=now,
-            content="<:no_1:1> `♡` `2` · **First** · Series",
-            embeds=[],
-        )
-        placeholder.channel.fetch_message = AsyncMock(return_value=filled)
 
         async def exercise() -> None:
             with patch("bot.asyncio.sleep", new_callable=AsyncMock):
@@ -280,7 +306,7 @@ class BotStateTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-        placeholder.channel.fetch_message.assert_awaited_with(789)
+        client.http.get_message.assert_awaited_with(channel_id, 789)
         self.assertIsNotNone(pending.evaluation)
         self.assertEqual(pending.evaluation.cards[0].name, "First")
         self.assertFalse(pending.evaluation_processed)
@@ -319,7 +345,7 @@ class BotStateTests(unittest.TestCase):
         client = object.__new__(KarutaClient)
         client._connection = SimpleNamespace(user=SimpleNamespace(id=999))
         client.config = SimpleNamespace(
-            target_channels=(channel_id,), evaluator_bot_id=456
+            target_channels=(channel_id,), evaluator_bot_id=456, drop_bot_id=646
         )
         client.pending_drops = {channel_id: pending}
         client._evaluator_tasks = {}
@@ -398,9 +424,754 @@ class BotStateTests(unittest.TestCase):
         asyncio.run(exercise())
 
         self.assertTrue(pending.evaluation_processed)
-        claim.assert_awaited_once_with(
-            image_message, "1\ufe0f\u20e3", pending.expires_at
+        claim.assert_awaited_once_with(image_message, 1, pending.expires_at)
+
+
+    def test_evaluator_signature_detection(self) -> None:
+        self.assertTrue(_looks_like_evaluator_output(_analysis_content()))
+        # Keqing-style line: numbered, comma thousands, no backticked code.
+        self.assertTrue(
+            _looks_like_evaluator_output(
+                "1. `♡1,448` **Rem** · Love Hina `#6,524`"
+            )
         )
+        self.assertFalse(_looks_like_evaluator_output("kd"))
+        self.assertFalse(_looks_like_evaluator_output(""))
+        self.assertFalse(
+            _looks_like_evaluator_output(
+                "I'm dropping 3 cards since we're active! Grab them quick!"
+            )
+        )
+        # The rotating tip footer must not match on its own.
+        self.assertFalse(
+            _looks_like_evaluator_output(
+                "-# Tip: Want drop embeds to only show for good cards? "
+                "Configure a channel override in `/config karuta view`"
+            )
+        )
+
+    def _watch_client(self, channel_id: int, pending: PendingDrop) -> object:
+        client = object.__new__(KarutaClient)
+        client._connection = SimpleNamespace(user=SimpleNamespace(id=999))
+        client.config = SimpleNamespace(
+            target_channels=(channel_id,),
+            evaluator_bot_id=456,
+            drop_bot_id=646,
+        )
+        client.pending_drops = {channel_id: pending}
+        client._evaluator_tasks = {}
+        client._hinted_foreign_evaluator = False
+        client._process_pending_drop = AsyncMock()
+        return client
+
+    @staticmethod
+    def _fake_message(
+        message_id: int,
+        author_id: int,
+        channel_id: int,
+        content: str,
+        created_at: datetime,
+        *,
+        bot: bool = False,
+        flags: int = 0,
+        components: list | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=message_id,
+            author=SimpleNamespace(id=author_id, bot=bot),
+            channel=SimpleNamespace(id=channel_id),
+            created_at=created_at,
+            content=content,
+            embeds=[],
+            attachments=[],
+            components=components or [],
+            webhook_id=None,
+            type=None,
+            flags=SimpleNamespace(value=flags),
+        )
+
+    @staticmethod
+    def _v2_raw_payload(message_id: int, expires_in: int = 50) -> dict:
+        """A raw Components V2 payload shaped like CardCompanion's analysis.
+
+        Text Display components (type 10) nested in a Section (9) inside a
+        Container (17); content is forced empty, which is how discord.py-self
+        versions without V2 support end up reading nothing.
+        """
+        expiry = int(time.time() + expires_in)
+        return {
+            "id": message_id,
+            "content": "",
+            "embeds": [],
+            "flags": IS_COMPONENTS_V2_FLAG,
+            "components": [
+                {
+                    "type": 17,
+                    "components": [
+                        {
+                            "type": 9,
+                            "components": [
+                                {
+                                    "type": 10,
+                                    "content": (
+                                        "<:yel_flower:1> <:no_1:1> `♡` `0` · `#85143` · `◈1` "
+                                        "· **Queen Mirage** · Happiness Charge Precure!"
+                                    ),
+                                },
+                                {
+                                    "type": 10,
+                                    "content": (
+                                        "<:yel_flower:1> <:no_2:2> `♡` `1` · `#18481` · `◈2` "
+                                        "· **Shou Daliuwan** · Scissor Seven"
+                                    ),
+                                },
+                                {
+                                    "type": 10,
+                                    "content": (
+                                        "<:yel_flower:1> <:no_3:3> `♡` `0` · `#85334` · `◈1` "
+                                        "· **Gingar** · Ozanari Dungeon"
+                                    ),
+                                },
+                            ],
+                        },
+                        {"type": 10, "content": f"Drop expires <t:{expiry}:R>."},
+                        {"type": 14, "divider": True, "spacing": 1},
+                        {
+                            "type": 10,
+                            "content": "-# Drop time: 125ms search time: 0.02ms",
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def test_own_account_analysis_is_processed(self) -> None:
+        """The core self-bot fix: the analysis is authored by THIS account."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        # Author 999 is the bot's own account (CardCompanion self-bot).
+        message = self._fake_message(
+            789, 999, channel_id, _analysis_content(), now
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_message(client, message)
+                task = client._evaluator_tasks[message.id]
+                await task
+
+        asyncio.run(exercise())
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(
+            [card.name for card in pending.evaluation.cards],
+            ["Queen Mirage", "Shou Daliuwan", "Gingar"],
+        )
+        client._process_pending_drop.assert_awaited_once_with(channel_id, pending)
+
+    def test_analysis_from_other_bot_is_processed(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        # Author 777: neither this account nor the configured evaluator.
+        message = self._fake_message(
+            789, 777, channel_id, _analysis_content(), now, bot=True
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_message(client, message)
+                task = client._evaluator_tasks[message.id]
+                await task
+
+        asyncio.run(exercise())
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[1].name, "Shou Daliuwan")
+
+    def test_plain_own_message_is_ignored(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        message = self._fake_message(789, 999, channel_id, "kd", now)
+
+        async def exercise() -> None:
+            await KarutaClient.on_message(client, message)
+
+        asyncio.run(exercise())
+
+        self.assertEqual(client._evaluator_tasks, {})
+        self.assertIsNone(pending.evaluation)
+
+    def test_empty_own_message_during_drop_is_refetched(self) -> None:
+        """Ghost/placeholder messages get one REST re-fetch before giving up."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        placeholder = self._fake_message(789, 999, channel_id, "", now)
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(
+                return_value={
+                    "id": 789,
+                    "content": _analysis_content(),
+                    "embeds": [],
+                }
+            )
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_message(client, placeholder)
+                task = client._evaluator_tasks[placeholder.id]
+                await task
+
+        asyncio.run(exercise())
+
+        client.http.get_message.assert_awaited_once_with(channel_id, 789)
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[0].name, "Queen Mirage")
+
+    def test_stale_expiry_analysis_is_ignored(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        # A quoted analysis from an earlier drop: expiry an hour in the past.
+        message = self._fake_message(
+            789, 999, channel_id, _analysis_content(expires_in=-3600), now
+        )
+
+        asyncio.run(
+            KarutaClient._handle_evaluator_message(client, message)
+        )
+
+        self.assertIsNone(pending.evaluation)
+
+    def test_fresh_expiry_allows_message_that_predates_announcement(self) -> None:
+        """Evaluators that reuse one persistent message per channel."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        # Created ten minutes ago, but its expiry is for the current drop.
+        message = self._fake_message(
+            789,
+            999,
+            channel_id,
+            _analysis_content(),
+            now - timedelta(minutes=10),
+        )
+
+        asyncio.run(
+            KarutaClient._handle_evaluator_message(client, message)
+        )
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[2].name, "Gingar")
+
+    def test_raw_edit_from_own_account_is_fetched_and_processed(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(
+                return_value={
+                    "id": 789,
+                    "content": _analysis_content(),
+                    "embeds": [],
+                }
+            )
+        )
+        payload = SimpleNamespace(
+            message_id=789,
+            channel_id=channel_id,
+            data={"author": {"id": "999"}},
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_raw_message_edit(client, payload)
+                task = client._evaluator_tasks[789]
+                await task
+
+        asyncio.run(exercise())
+
+        client.http.get_message.assert_awaited_once_with(channel_id, 789)
+        self.assertIsNotNone(pending.evaluation)
+
+    def test_raw_edit_from_other_user_without_content_is_skipped(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        fake_channel = SimpleNamespace(
+            id=channel_id, fetch_message=AsyncMock()
+        )
+        client.get_channel = Mock(return_value=fake_channel)
+        payload = SimpleNamespace(
+            message_id=789,
+            channel_id=channel_id,
+            data={"author": {"id": "555"}, "content": ""},
+        )
+
+        asyncio.run(KarutaClient.on_raw_message_edit(client, payload))
+
+        fake_channel.fetch_message.assert_not_awaited()
+        self.assertEqual(client._evaluator_tasks, {})
+
+    def test_text_from_raw_extracts_components_v2(self) -> None:
+        raw = self._v2_raw_payload(789)
+
+        text = _text_from_raw(raw)
+
+        self.assertIn("**Queen Mirage**", text)
+        self.assertIn("**Shou Daliuwan**", text)
+        self.assertIn("Drop expires <t:", text)
+        self.assertIn("-# Drop time:", text)
+        self.assertTrue(_looks_like_evaluator_output(text))
+
+        # Normal content and embeds still come through.
+        self.assertEqual(
+            _text_from_raw({"content": "hello", "components": []}),
+            "hello",
+        )
+        self.assertEqual(
+            _text_from_raw(
+                {
+                    "content": "",
+                    "embeds": [{"title": "T", "description": "D"}],
+                }
+            ),
+            "T\nD",
+        )
+
+    def test_v2_evaluator_message_is_read_via_raw_api(self) -> None:
+        """The 01:12 production failure: a Components V2 analysis that the
+        library parses as content='' and embeds=[] through every fetch."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+            card_messages=[
+                self._fake_message(2, 646, channel_id, "", now, bot=True)
+            ],
+        )
+        client = self._watch_client(channel_id, pending)
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(return_value=self._v2_raw_payload(789))
+        )
+        # What discord.py-self 2.1.0 hands over for a V2 message: the
+        # component payload was silently dropped, content is empty.
+        message = self._fake_message(
+            789, 456, channel_id, "", now, bot=True, flags=IS_COMPONENTS_V2_FLAG
+        )
+
+        asyncio.run(KarutaClient._handle_evaluator_message(client, message))
+
+        client.http.get_message.assert_awaited_once_with(channel_id, 789)
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(
+            [card.name for card in pending.evaluation.cards],
+            ["Queen Mirage", "Shou Daliuwan", "Gingar"],
+        )
+        client._process_pending_drop.assert_awaited_once_with(channel_id, pending)
+
+    def test_v2_message_from_foreign_bot_is_scheduled_and_read(self) -> None:
+        """V2 analysis from a bot that is NOT the configured evaluator."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(return_value=self._v2_raw_payload(789))
+        )
+        message = self._fake_message(
+            789, 777, channel_id, "", now, bot=True, flags=IS_COMPONENTS_V2_FLAG
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_message(client, message)
+                task = client._evaluator_tasks[789]
+                await task
+
+        asyncio.run(exercise())
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[1].name, "Shou Daliuwan")
+
+    def test_raw_edit_with_v2_payload_is_processed(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        payload = SimpleNamespace(
+            message_id=789,
+            channel_id=channel_id,
+            data={
+                "author": {"id": "777"},
+                "flags": IS_COMPONENTS_V2_FLAG,
+                "components": self._v2_raw_payload(789)["components"],
+            },
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_raw_message_edit(client, payload)
+                task = client._evaluator_tasks[789]
+                await task
+
+        asyncio.run(exercise())
+
+        self.assertIsNotNone(pending.evaluation)
+
+    def test_raw_edit_from_v2_payload_needs_no_fetch(self) -> None:
+        """A V2 edit settles straight from the gateway payload.
+
+        The edit payload carries the Components V2 text itself, so no HTTP
+        fetch (and no cached channel object) may be needed at all.
+        """
+        channel_id = 123
+        message_id = (int(time.time() * 1000) - 1420070400000) << 22 | 4242
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            announced_at=now.timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        # Deliberately no http attribute: nothing may be fetched.
+        payload = SimpleNamespace(
+            message_id=message_id,
+            channel_id=channel_id,
+            data={
+                "author": {"id": "777", "bot": True},
+                "flags": IS_COMPONENTS_V2_FLAG,
+                "components": self._v2_raw_payload(message_id)["components"],
+            },
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient.on_raw_message_edit(client, payload)
+                task = client._evaluator_tasks[message_id]
+                await task
+
+        asyncio.run(exercise())
+
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[0].name, "Queen Mirage")
+
+    def test_raw_fetch_falls_back_to_history_window(self) -> None:
+        """http.get_message ("?limit=1&around=") can miss the newest message.
+
+        When it raises, the deterministic ?before= history window must still
+        return the payload so the V2 analysis is not lost.
+        """
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        client = self._watch_client(channel_id, pending)
+        target = self._v2_raw_payload(789)
+        client.http = SimpleNamespace(
+            get_message=AsyncMock(
+                side_effect=discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"),
+                    "Unknown Message",
+                )
+            ),
+            logs_from=AsyncMock(
+                return_value=[{"id": 788, "content": "chat"}, target]
+            ),
+        )
+        message = self._fake_message(
+            789, 777, channel_id, "", now, bot=True, flags=IS_COMPONENTS_V2_FLAG
+        )
+
+        asyncio.run(KarutaClient._handle_evaluator_message(client, message))
+
+        client.http.logs_from.assert_awaited_once_with(channel_id, 10, before=790)
+        client.http.get_message.assert_awaited_once_with(channel_id, 789)
+        self.assertIsNotNone(pending.evaluation)
+        self.assertEqual(pending.evaluation.cards[1].name, "Shou Daliuwan")
+
+    def test_image_message_accepts_embed_images(self) -> None:
+        """Karuta layouts that render cards as embed images still count."""
+        embed = SimpleNamespace(
+            image=SimpleNamespace(url="https://cdn.example/card.png"),
+            thumbnail=SimpleNamespace(url=None),
+        )
+        message = SimpleNamespace(
+            attachments=[], embeds=[embed]
+        )
+        self.assertTrue(_is_image_message(message))
+
+        empty_embed = SimpleNamespace(
+            image=SimpleNamespace(url=None),
+            thumbnail=SimpleNamespace(url=None),
+        )
+        self.assertFalse(
+            _is_image_message(SimpleNamespace(attachments=[], embeds=[empty_embed]))
+        )
+        self.assertFalse(
+            _is_image_message(SimpleNamespace(attachments=[], embeds=[]))
+        )
+
+
+class GrabEmojiTests(unittest.TestCase):
+    """The grab is an emoji reaction on the card message, not a button."""
+
+    def _client(self, grab_emoji: str = "") -> object:
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(grab_emoji=grab_emoji)
+        return client
+
+    @staticmethod
+    def _reaction(emoji: str) -> SimpleNamespace:
+        return SimpleNamespace(emoji=emoji)
+
+    def test_first_non_number_emoji_skips_keycaps(self) -> None:
+        reactions = [self._reaction("1\ufe0f\u20e3"), self._reaction("<:kx:123>")]
+        self.assertEqual(_first_non_number_emoji(reactions), "<:kx:123>")
+        self.assertIsNone(_first_non_number_emoji([self._reaction("2\ufe0f\u20e3")]))
+        self.assertIsNone(_first_non_number_emoji(None))
+        self.assertIsNone(_first_non_number_emoji([]))
+
+    def test_first_non_number_emoji_raw_builds_custom_emoji(self) -> None:
+        raw = [
+            {"emoji": {"name": "2\ufe0f\u20e3", "id": None}},
+            {"emoji": {"name": "kx", "id": 123}},
+        ]
+        self.assertEqual(_first_non_number_emoji_raw(raw), "<:kx:123>")
+        animated = [{"emoji": {"name": "kx", "id": 123, "animated": True}}]
+        self.assertEqual(_first_non_number_emoji_raw(animated), "<a:kx:123>")
+        self.assertEqual(
+            _first_non_number_emoji_raw([{"emoji": {"name": "\u2764", "id": None}}]),
+            "\u2764",
+        )
+        self.assertEqual(
+            _first_non_number_emoji_raw([{"emoji": {"name": "5", "id": None}}]),
+            None,
+        )
+
+    def test_env_override_wins(self) -> None:
+        client = self._client(grab_emoji="\u2764")
+        message = SimpleNamespace(reactions=[self._reaction("<:kx:123>")])
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 1, time.time() + 30)
+        )
+        self.assertEqual(emoji, "\u2764")
+        self.assertIn("KARUTA_GRAB_EMOJI", source)
+
+    def test_emoji_read_from_card_message_reactions(self) -> None:
+        client = self._client()
+        message = SimpleNamespace(
+            id=5,
+            channel=SimpleNamespace(id=123),
+            reactions=[self._reaction("1\ufe0f\u20e3"), self._reaction("<:kx:123>")],
+        )
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 1, time.time() + 30)
+        )
+        self.assertEqual(emoji, "<:kx:123>")
+        self.assertIn("card message", source)
+
+    def test_emoji_read_from_rest_copy_when_reactions_empty(self) -> None:
+        client = self._client()
+        client._fetch_raw_message = AsyncMock(
+            return_value={"reactions": [{"emoji": {"name": "kx", "id": 123}}]}
+        )
+        message = SimpleNamespace(id=5, channel=SimpleNamespace(id=123), reactions=[])
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 2, time.time() + 30)
+        )
+        self.assertEqual(emoji, "<:kx:123>")
+        self.assertIn("REST", source)
+        client._fetch_raw_message.assert_awaited_once_with(123, 5)
+
+    def test_number_keycap_fallback_after_nothing_appears(self) -> None:
+        """No grab emoji anywhere: fall back to the slot keycap instead of
+        waiting for another player to react first (the old silent failure)."""
+        client = self._client()
+        client._fetch_raw_message = AsyncMock(return_value={"reactions": []})
+        client.wait_for = AsyncMock(side_effect=asyncio.TimeoutError())
+        message = SimpleNamespace(id=5, channel=SimpleNamespace(id=123), reactions=[])
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 2, time.time() + 30)
+        )
+        self.assertEqual(emoji, "2\ufe0f\u20e3")
+        self.assertIn("fallback", source)
+        client.wait_for.assert_awaited_once()
+
+    def test_live_reaction_is_used_when_karuta_adds_it_late(self) -> None:
+        client = self._client()
+        client._fetch_raw_message = AsyncMock(return_value=None)
+        client.wait_for = AsyncMock(
+            return_value=(
+                SimpleNamespace(message=SimpleNamespace(id=5), emoji="<:kx:123>"),
+                SimpleNamespace(id=42),
+            )
+        )
+        message = SimpleNamespace(id=5, channel=SimpleNamespace(id=123), reactions=[])
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 3, time.time() + 30)
+        )
+        self.assertEqual(emoji, "<:kx:123>")
+        self.assertIn("live reaction", source)
+
+    def test_claim_card_reacts_with_resolved_emoji(self) -> None:
+        client = self._client()
+        client._claim_lock = asyncio.Lock()
+        client.pending_grab = None
+        client.grab_cooldown_until = 0.0
+        client._expire_pending_grab = AsyncMock()
+        message = SimpleNamespace(
+            id=5,
+            channel=SimpleNamespace(id=123),
+            reactions=[self._reaction("<:kx:123>")],
+            add_reaction=AsyncMock(),
+        )
+
+        async def exercise() -> None:
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                await KarutaClient._claim_card(client, message, 2, time.time() + 30)
+
+        asyncio.run(exercise())
+
+        message.add_reaction.assert_awaited_once_with("<:kx:123>")
+        self.assertIsNotNone(client.pending_grab)
+
+    @staticmethod
+    def _image_message(message_id: int, channel_id: int, created_at) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=message_id,
+            channel=SimpleNamespace(id=channel_id),
+            created_at=created_at,
+            attachments=[
+                SimpleNamespace(content_type="image/png", filename="card.png")
+            ],
+        )
+
+    def test_slot_two_targets_second_card_message(self) -> None:
+        """Karuta posts one message per card: slot N grabs the Nth message."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        first = self._image_message(10, channel_id, now)
+        second = self._image_message(11, channel_id, now + timedelta(seconds=1))
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        claim = AsyncMock()
+        client._claim_card = claim
+        evaluator_message = SimpleNamespace(
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now + timedelta(seconds=2),
+            content=(
+                "<:no_1:1> `♡` `0` · **A** · Series\n"
+                "<:no_2:2> `♡` `5` · **B** · Series"
+            ),
+            embeds=[],
+        )
+
+        async def exercise() -> None:
+            await KarutaClient._attach_drop_image(client, first)
+            await KarutaClient._attach_drop_image(client, second)
+            await KarutaClient._handle_evaluator_message(client, evaluator_message)
+
+        asyncio.run(exercise())
+
+        self.assertEqual(len(pending.card_messages), 2)
+        self.assertTrue(pending.evaluation_processed)
+        # Slot 2 (♡5) wins over slot 1 (♡0): the second message is grabbed.
+        claim.assert_awaited_once_with(second, 2, pending.expires_at)
+
+    def test_missing_card_messages_get_a_short_grace(self) -> None:
+        """Evaluation ready before every card message: wait briefly instead
+        of grabbing the wrong (only) tracked message at once."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        first = self._image_message(10, channel_id, now)
+        second = self._image_message(11, channel_id, now + timedelta(seconds=1))
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        claim = AsyncMock()
+        client._claim_card = claim
+        evaluator_message = SimpleNamespace(
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content=(
+                "<:no_1:1> `♡` `0` · **A** · Series\n"
+                "<:no_2:2> `♡` `5` · **B** · Series"
+            ),
+            embeds=[],
+        )
+
+        async def exercise() -> None:
+            await KarutaClient._handle_evaluator_message(client, evaluator_message)
+            await KarutaClient._attach_drop_image(client, first)
+            self.assertFalse(pending.evaluation_processed)
+            self.assertTrue(pending.card_grace_scheduled)
+            claim.assert_not_awaited()
+            await KarutaClient._attach_drop_image(client, second)
+
+        asyncio.run(exercise())
+
+        self.assertTrue(pending.evaluation_processed)
+        claim.assert_awaited_once_with(second, 2, pending.expires_at)
 
 
 if __name__ == "__main__":
