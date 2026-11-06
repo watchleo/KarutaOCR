@@ -14,7 +14,11 @@ from pathlib import Path
 import discord
 from dotenv import dotenv_values
 
-from evaluator import Evaluation, choose_card, parse_evaluator_message
+from evaluator import (
+    Evaluation,
+    explain_choice,
+    parse_evaluator_message,
+)
 from stealth import (
     Backoff,
     CaptchaRequired,
@@ -59,15 +63,19 @@ COMMAND_SPREAD_SECONDS = 150
 GRAB_COOLDOWN_SECONDS = 10 * 60
 FAILED_GRAB_COOLDOWN_SECONDS = 75
 CLAIM_WINDOW_SECONDS = 59
-# Karuta posts one message per card, moments apart; when the evaluation is
-# ready first, wait this long for the remaining card messages to arrive.
+# Karuta's current layout puts every card of a drop in ONE message (the
+# announcement itself) and pre-adds the number keycaps 1..N as grab buttons.
+# Older/per-card layouts posted several card messages; if the evaluation is
+# ready before all of them arrive, wait this long before falling back to the
+# closest tracked message.  A visible keycap row proves the single-message
+# layout and skips the wait entirely.
 CARD_ARRIVAL_GRACE_SECONDS = 2.0
 REACTION_READY_TIMEOUT_SECONDS = 15
 ANNOUNCEMENT_TIMEOUT_SECONDS = 30
 TYPING_SECONDS = (1.1, 2.9)
 REACTION_DELAY_SECONDS = (0.07, 0.22)
 PENDING_DROP_TTL_SECONDS = 180
-# Karuta drops one message per card; track at most this many per drop.
+# Defensive cap for the per-card-message layouts; single-message drops track 1.
 MAX_CARD_MESSAGES = 8
 EVALUATOR_SETTLE_SECONDS = 3.0
 # A message that already looks like a finished analysis is acted on quickly;
@@ -122,11 +130,14 @@ class Config:
 class PendingDrop:
     announcement_id: int
     expires_at: float
-    # Karuta posts one message per card; slots map to arrival order.
+    # Single-message drops (the current layout) track one message that holds
+    # every card; per-card layouts would list one message per slot.
     card_messages: list[discord.Message] = field(default_factory=list)
     evaluation: Evaluation | None = None
     evaluation_processed: bool = False
     announced_at: float = 0.0
+    # True once the number-keycap row proved a single-message (combined) drop.
+    combined_confirmed: bool = False
     # True once the short wait for missing card messages has been scheduled.
     card_grace_scheduled: bool = False
 
@@ -369,6 +380,40 @@ def _first_non_number_emoji_raw(raw_reactions: object) -> str | None:
         if name and name not in _NUMBER_KEYCAPS:
             return name
     return None
+
+
+def _normalized_emoji(emoji: str) -> str:
+    """Compare keycap emoji reliably: strip the optional variation selector."""
+    return emoji.replace("\ufe0f", "")
+
+
+def _raw_emoji_names(raw_reactions: object) -> set[str]:
+    """Normalized emoji names present in a raw REST payload's reactions."""
+    names: set[str] = set()
+    for entry in raw_reactions or []:
+        if not isinstance(entry, dict):
+            continue
+        emoji = entry.get("emoji") or {}
+        if isinstance(emoji, dict) and emoji.get("name"):
+            names.add(_normalized_emoji(str(emoji["name"])))
+    return names
+
+
+def _number_keycaps_in(reactions: object) -> set[str]:
+    """The normalized number keycaps (1-4) present on a message."""
+    wanted = {_normalized_emoji(emoji) for emoji in REACTION_EMOJIS}
+    found = {
+        _normalized_emoji(str(getattr(reaction, "emoji", "") or ""))
+        for reaction in reactions or []
+    }
+    return found & wanted
+
+
+def _number_keycaps_in_raw(raw_reactions: object) -> set[str]:
+    """Same as _number_keycaps_in, for a raw REST payload's reactions."""
+    return _raw_emoji_names(raw_reactions) & {
+        _normalized_emoji(emoji) for emoji in REACTION_EMOJIS
+    }
 
 
 def _kd_payload() -> str:
@@ -1105,39 +1150,57 @@ class KarutaClient(discord.Client):
             and not pending.card_grace_scheduled
             and time.time() + CARD_ARRIVAL_GRACE_SECONDS < pending.expires_at
         ):
-            # The evaluator lists more cards than have been seen as messages;
-            # Karuta posts them a moment apart, so give the rest a short grace
-            # before falling back to the closest tracked message.
-            pending.card_grace_scheduled = True
-            log.info(
-                "Evaluation ready in channel %s; %d of %d card message(s) "
-                "tracked; waiting up to %.1fs for the rest.",
-                channel_id,
-                len(pending.card_messages),
-                expected,
-                CARD_ARRIVAL_GRACE_SECONDS,
-            )
-            asyncio.create_task(self._wait_for_remaining_cards(channel_id, pending))
-            return
+            if await self._combined_drop_confirmed(pending, expected):
+                # The whole keycap row is on the tracked message: this is a
+                # single-message (combined) drop, the "missing" card messages
+                # will never arrive, and reacting now keeps the grab well
+                # inside the ~60s claim window.
+                pending.combined_confirmed = True
+            else:
+                # The evaluator lists more cards than have been seen as
+                # messages; Karuta posts them a moment apart, so give the rest
+                # a short grace before falling back to the closest tracked
+                # message.
+                pending.card_grace_scheduled = True
+                log.info(
+                    "Evaluation ready in channel %s; %d of %d card message(s) "
+                    "tracked; waiting up to %.1fs for the rest.",
+                    channel_id,
+                    len(pending.card_messages),
+                    expected,
+                    CARD_ARRIVAL_GRACE_SECONDS,
+                )
+                asyncio.create_task(
+                    self._wait_for_remaining_cards(channel_id, pending)
+                )
+                return
 
         pending.evaluation_processed = True
-        chosen = choose_card(evaluation)
+        # Every card the evaluator listed, with the stats the choice is made
+        # from: this line is the proof that the whole evaluation was read.
+        log.info(
+            "Drop decision input in channel %s - %d card(s) evaluated: %s.",
+            channel_id,
+            len(evaluation.cards),
+            "; ".join(
+                "slot %d (♡%s%s, %s)"
+                % (
+                    card.slot,
+                    card.wishlist_count,
+                    f" #{card.print_number}"
+                    if card.print_number is not None
+                    else "",
+                    card.name,
+                )
+                for card in evaluation.cards
+            ),
+        )
+        chosen, reason = explain_choice(evaluation)
         if chosen is None:
             log.warning(
-                "Skipping drop in channel %s - no eligible card among: %s.",
+                "Skipping drop in channel %s - no card met the grabbing "
+                "rules (see the evaluated cards above).",
                 channel_id,
-                "; ".join(
-                    "slot %d (\u2661%s%s, %s)"
-                    % (
-                        card.slot,
-                        card.wishlist_count,
-                        f" #{card.print_number}"
-                        if card.print_number is not None
-                        else "",
-                        card.name,
-                    )
-                    for card in evaluation.cards
-                ),
             )
             return
         if time.time() >= pending.expires_at:
@@ -1149,20 +1212,54 @@ class KarutaClient(discord.Client):
             else pending.card_messages[-1]
         )
         if chosen.slot > len(pending.card_messages):
-            log.warning(
-                "Slot %d chosen but only %d card message(s) tracked; "
-                "targeting the last one.",
-                chosen.slot,
-                len(pending.card_messages),
-            )
+            if pending.combined_confirmed:
+                log.info(
+                    "Combined drop: slot %d is grabbed with its keycap on the "
+                    "single drop message.",
+                    chosen.slot,
+                )
+            else:
+                log.warning(
+                    "Slot %d chosen but only %d card message(s) tracked; "
+                    "targeting the last one.",
+                    chosen.slot,
+                    len(pending.card_messages),
+                )
         log.info(
-            "Slot %s -> %s (\u2661%s%s).",
+            "Slot %s -> %s (♡%s%s; %s).",
             chosen.slot,
             chosen.name,
             chosen.wishlist_count,
             f", #{chosen.print_number}" if chosen.print_number is not None else "",
+            reason,
         )
         await self._claim_card(target, chosen.slot, pending.expires_at)
+
+    async def _combined_drop_confirmed(
+        self, pending: PendingDrop, expected: int
+    ) -> bool:
+        """True when the tracked drop message already carries the slot keycaps.
+
+        Karuta's current layout puts every card of a drop into ONE message
+        and pre-adds the number keycaps 1..N as the grab buttons.  When that
+        keycap row is visible there is nothing left to wait for: reacting
+        right away keeps the grab well inside the ~60s claim window instead
+        of burning it on a grace period for messages that will never come.
+        """
+        if not pending.card_messages:
+            return False
+        message = pending.card_messages[0]
+        wanted = {_normalized_emoji(emoji) for emoji in REACTION_EMOJIS[:expected]}
+        if wanted <= _number_keycaps_in(getattr(message, "reactions", None)):
+            return True
+        channel = getattr(message, "channel", None)
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
+            return False
+        raw_data = await self._fetch_raw_message(channel_id, message.id)
+        if raw_data is None:
+            return False
+        return wanted <= _number_keycaps_in_raw(raw_data.get("reactions"))
 
     async def _wait_for_remaining_cards(
         self, channel_id: int, pending: PendingDrop
@@ -1172,6 +1269,18 @@ class KarutaClient(discord.Client):
         current = self.pending_drops.get(channel_id)
         if current is not pending:
             return
+        evaluation = pending.evaluation
+        if (
+            evaluation is not None
+            and len(evaluation.cards) > len(pending.card_messages)
+            and not pending.combined_confirmed
+            and await self._combined_drop_confirmed(
+                pending, len(evaluation.cards)
+            )
+        ):
+            # The keycap row appeared during the grace period: this is a
+            # combined drop after all, not missing per-card messages.
+            pending.combined_confirmed = True
         try:
             await self._process_pending_drop(channel_id, pending)
         except Exception as error:  # a background task must never die silently
@@ -1184,27 +1293,44 @@ class KarutaClient(discord.Client):
 
         Grabbing in Karuta is an emoji reaction on the card message - not a
         button - and Karuta pre-adds that emoji to every card message, so the
-        message itself is the source of truth.  An explicit KARUTA_GRAB_EMOJI
-        override always wins; a fresh REST copy and a short live wait cover
-        messages that arrived before the emoji was added; the slot's number
-        keycap is the final fallback for servers where cards are picked with
-        numbered reactions.
+        message itself is the source of truth.  Combined drops (one message,
+        several cards) are grabbed with the slot's NUMBER KEYCAP: when the
+        whole keycap row 1..N is already on the message, that is the grab
+        button and it is used at once - waiting for a custom emoji would only
+        burn claim-window time.  An explicit KARUTA_GRAB_EMOJI override
+        always wins; a fresh REST copy and a short live wait cover messages
+        whose emoji had not been added yet; the slot's number keycap is the
+        final fallback for servers where cards are picked with numbered
+        reactions.
         """
         override = (getattr(self.config, "grab_emoji", "") or "").strip()
         if override:
             return override, "KARUTA_GRAB_EMOJI override"
 
-        emoji = _first_non_number_emoji(getattr(message, "reactions", None))
-        if emoji:
-            return emoji, "reactions on the card message"
+        keycap = (
+            REACTION_EMOJIS[slot - 1] if 1 <= slot <= len(REACTION_EMOJIS) else None
+        )
+        reactions = getattr(message, "reactions", None)
+        # Two or more number keycaps on one message = Karuta's combined drop
+        # (one message, several cards): the keycaps ARE the grab buttons.
+        if keycap is not None and len(_number_keycaps_in(reactions)) >= 2:
+            return keycap, "slot keycap on the drop message"
 
         channel_id = getattr(getattr(message, "channel", None), "id", None)
         if channel_id is not None:
             raw_data = await self._fetch_raw_message(channel_id, message.id)
             if raw_data is not None:
+                if keycap is not None and len(
+                    _number_keycaps_in_raw(raw_data.get("reactions"))
+                ) >= 2:
+                    return keycap, "slot keycap in a fresh REST copy"
                 emoji = _first_non_number_emoji_raw(raw_data.get("reactions"))
                 if emoji:
                     return emoji, "reactions in a fresh REST copy"
+
+        emoji = _first_non_number_emoji(reactions)
+        if emoji:
+            return emoji, "reactions on the card message"
 
         timeout = min(REACTION_READY_TIMEOUT_SECONDS, expires_at - time.time() - 0.5)
         if timeout > 0:
@@ -1225,8 +1351,8 @@ class KarutaClient(discord.Client):
             else:
                 return str(reaction.emoji), f"live reaction (added by {user})"
 
-        if 1 <= slot <= len(REACTION_EMOJIS):
-            return REACTION_EMOJIS[slot - 1], "slot keycap fallback"
+        if keycap is not None:
+            return keycap, "slot keycap fallback"
         return None, "no emoji found"
 
     async def _claim_card(

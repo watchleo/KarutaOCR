@@ -1064,6 +1064,83 @@ class GrabEmojiTests(unittest.TestCase):
         self.assertEqual(emoji, "<:kx:123>")
         self.assertIn("live reaction", source)
 
+    def test_combined_drop_uses_slot_keycap_immediately(self) -> None:
+        """One message carrying the keycap row 1-3 (Karuta's combined drop):
+        the slot's keycap IS the grab button, used at once - no custom-emoji
+        wait.  Production regression: that wait pushed the reaction to T+21s
+        of a 60s claim window."""
+        client = self._client()
+        client._fetch_raw_message = AsyncMock()
+        message = SimpleNamespace(
+            id=5,
+            channel=SimpleNamespace(id=123),
+            reactions=[
+                self._reaction("1\ufe0f\u20e3"),
+                self._reaction("2\ufe0f\u20e3"),
+                self._reaction("3\ufe0f\u20e3"),
+            ],
+        )
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 2, time.time() + 30)
+        )
+        self.assertEqual(emoji, "2\ufe0f\u20e3")
+        self.assertIn("slot keycap", source)
+        client._fetch_raw_message.assert_not_awaited()
+
+    def test_combined_drop_keycap_beats_player_emoji(self) -> None:
+        """A custom emoji on a combined drop is a player's reaction, not the
+        grab button: the keycap row wins."""
+        client = self._client()
+        client._fetch_raw_message = AsyncMock()
+        message = SimpleNamespace(
+            id=5,
+            channel=SimpleNamespace(id=123),
+            reactions=[
+                self._reaction("1\ufe0f\u20e3"),
+                self._reaction("2\ufe0f\u20e3"),
+                self._reaction("<:kx:123>"),
+            ],
+        )
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 2, time.time() + 30)
+        )
+        self.assertEqual(emoji, "2\ufe0f\u20e3")
+        client._fetch_raw_message.assert_not_awaited()
+
+    def test_keycap_row_read_from_rest_copy(self) -> None:
+        """Keycaps without the variation selector must still match."""
+        client = self._client()
+        client._fetch_raw_message = AsyncMock(
+            return_value={
+                "reactions": [
+                    {"emoji": {"name": "1\u20e3", "id": None}},
+                    {"emoji": {"name": "2\u20e3", "id": None}},
+                    {"emoji": {"name": "3\u20e3", "id": None}},
+                ]
+            }
+        )
+        message = SimpleNamespace(id=5, channel=SimpleNamespace(id=123), reactions=[])
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 3, time.time() + 30)
+        )
+        self.assertEqual(emoji, "3\ufe0f\u20e3")
+        self.assertIn("REST", source)
+
+    def test_single_keycap_is_not_a_combined_drop(self) -> None:
+        """A lone keycap could be a player's pick on a per-card message: the
+        pre-added custom emoji still wins there."""
+        client = self._client()
+        message = SimpleNamespace(
+            id=5,
+            channel=SimpleNamespace(id=123),
+            reactions=[self._reaction("2\ufe0f\u20e3"), self._reaction("<:kx:123>")],
+        )
+        emoji, source = asyncio.run(
+            KarutaClient._resolve_grab_emoji(client, message, 2, time.time() + 30)
+        )
+        self.assertEqual(emoji, "<:kx:123>")
+        self.assertIn("card message", source)
+
     def test_claim_card_reacts_with_resolved_emoji(self) -> None:
         client = self._client()
         client._claim_lock = asyncio.Lock()
@@ -1172,6 +1249,95 @@ class GrabEmojiTests(unittest.TestCase):
 
         self.assertTrue(pending.evaluation_processed)
         claim.assert_awaited_once_with(second, 2, pending.expires_at)
+
+    def test_combined_drop_skips_grace_and_grabs_qualifying_card(self) -> None:
+        """Production layout (2026-11-06): Karuta's drop is ONE message with
+        the keycap row 1-3.  The bot must (a) not wait 2s for per-card
+        messages that will never come and (b) grab the card that meets the
+        tiered rules - here Yuki Mitsuya (print #44,190, ♡10 qualifies under
+        the 7+ high-print rule) - with its keycap right away."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        only = self._image_message(10, channel_id, now)
+        only.reactions = [
+            self._reaction("1\ufe0f\u20e3"),
+            self._reaction("2\ufe0f\u20e3"),
+            self._reaction("3\ufe0f\u20e3"),
+        ]
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        claim = AsyncMock()
+        client._claim_card = claim
+        evaluator_message = SimpleNamespace(
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content=(
+                "<:no_1:1> `♡` `1` · `#85420` · **Rick** · Final Fantasy VII: On the Way to a Smile, Episode: Denzel\n"
+                "<:no_2:2> `♡` `10` · `#44190` · **Yuki Mitsuya** · ODDTAXI\n"
+                "<:no_3:3> `♡` `1` · `#85487` · **Moeka China** · High School Fleet"
+            ),
+            embeds=[],
+        )
+
+        async def exercise() -> None:
+            await KarutaClient._attach_drop_image(client, only)
+            await KarutaClient._handle_evaluator_message(client, evaluator_message)
+
+        asyncio.run(exercise())
+
+        self.assertTrue(pending.evaluation_processed)
+        self.assertFalse(pending.card_grace_scheduled)
+        self.assertTrue(pending.combined_confirmed)
+        # The only qualifying card (high print, 7+ wishes), grabbed on the
+        # single message with its keycap.
+        claim.assert_awaited_once_with(only, 2, pending.expires_at)
+
+    def test_combined_drop_all_low_wishlist_high_prints_is_skipped(self) -> None:
+        """The exact 2026-11-06 05:17 drop: three high prints with ♡1 each.
+        Rule 4 (high prints need 7+ wishes) means NO grab at all - the drop
+        is skipped by design, and no reaction is ever sent."""
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+        )
+        only = self._image_message(10, channel_id, now)
+        only.reactions = [
+            self._reaction("1\ufe0f\u20e3"),
+            self._reaction("2\ufe0f\u20e3"),
+            self._reaction("3\ufe0f\u20e3"),
+        ]
+        client = object.__new__(KarutaClient)
+        client.config = SimpleNamespace(target_channels=(channel_id,))
+        client.pending_drops = {channel_id: pending}
+        claim = AsyncMock()
+        client._claim_card = claim
+        evaluator_message = SimpleNamespace(
+            channel=SimpleNamespace(id=channel_id),
+            created_at=now,
+            content=(
+                "<:no_1:1> `♡` `1` · `#85420` · **Rick** · Final Fantasy VII: On the Way to a Smile, Episode: Denzel\n"
+                "<:no_2:2> `♡` `1` · `#44190` · **Yuki Mitsuya** · ODDTAXI\n"
+                "<:no_3:3> `♡` `1` · `#85487` · **Moeka China** · High School Fleet"
+            ),
+            embeds=[],
+        )
+
+        async def exercise() -> None:
+            await KarutaClient._attach_drop_image(client, only)
+            await KarutaClient._handle_evaluator_message(client, evaluator_message)
+
+        asyncio.run(exercise())
+
+        self.assertTrue(pending.evaluation_processed)
+        self.assertTrue(pending.combined_confirmed)
+        claim.assert_not_awaited()
 
 
 if __name__ == "__main__":

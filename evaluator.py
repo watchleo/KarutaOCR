@@ -14,12 +14,27 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-MAX_TARGET_PRINT_NUMBER = 999
+MAX_TARGET_PRINT_NUMBER = 999  # deprecated: kept only for old imports
 
-# When every print number on a drop exceeds MAX_TARGET_PRINT_NUMBER, fall
-# back to wishlist counts instead of skipping the drop entirely. Set to
-# False to restore the original strict skip behaviour.
-FALLBACK_TO_WISHLIST = True
+# ---- Smart-grab priority rules --------------------------------------------
+# The print-number RANGE decides first; the wishlist count only ranks cards
+# inside the same range.  A lower print number never beats a higher print
+# number in the same range just by being lower.
+#
+#   1. prints 1-9     (SP)  always grabbed; ranked by highest wishlist count
+#   2. prints 10-99   (LP)  always grabbed; ranked by highest wishlist count
+#   3. prints 100-999 (MP)  grabbed with HIGH_PRINT_WISHLIST_THRESHOLD (7+)
+#                           wishes, highest count first; 1-6 wishes only as a
+#                           last resort when nothing else qualifies
+#   4. prints 1000+   (HP)  grabbed ONLY with 7+ wishes - never fewer
+#
+# When no card qualifies, GRAB_LAST_RESORT decides whether the best
+# remaining low-wishlist card is still taken (True) or the drop is skipped
+# (False).  Cards whose print the evaluator did not show follow a pure
+# wishlist ladder (7+ preferred, then any positive count) and only compete
+# with printed cards in the last-resort band.
+HIGH_PRINT_WISHLIST_THRESHOLD = 7
+GRAB_LAST_RESORT = True
 
 # Separators seen between the segments of an evaluator line.
 _SEP = r"[·•∙⋅]"
@@ -176,29 +191,85 @@ def parse_evaluator_message(content: str) -> Evaluation | None:
     )
 
 
-def choose_card(evaluation: Evaluation) -> EvaluatedCard | None:
-    """Prefer the lowest print number up to 999; otherwise use wishlist counts.
+def _print_band(print_number: int) -> int:
+    """0 = 1-9 (SP), 1 = 10-99 (LP), 2 = 100-999 (MP), 3 = 1000+ (HP)."""
+    if print_number <= 9:
+        return 0
+    if print_number <= 99:
+        return 1
+    if print_number <= 999:
+        return 2
+    return 3
 
-    If prints are present but every one of them exceeds the limit, fall back
-    to the highest positive wishlist count (unless FALLBACK_TO_WISHLIST is
-    False, which restores the original "skip the drop" behaviour).
+
+def _best_of(cards: list[EvaluatedCard]) -> EvaluatedCard:
+    """Highest wishlist count, then lowest print number, then lowest slot."""
+    return min(
+        cards,
+        key=lambda card: (
+            -card.wishlist_count,
+            card.print_number if card.print_number is not None else float("inf"),
+            card.slot,
+        ),
+    )
+
+
+def explain_choice(evaluation: Evaluation) -> tuple[EvaluatedCard | None, str]:
+    """Apply the tiered grabbing rules; return the card and the winning rule.
+
+    Ladder (first non-empty band wins, a lower-priority range never beats a
+    qualifying card from a higher-priority one):
+      1. prints 1-9, any wishes            -> "single print (1-9)"
+      2. prints 10-99, any wishes          -> "low print (10-99)"
+      3. prints 100-999 with 7+ wishes     -> "mid print (100-999), wishlist 7+"
+      4. prints 1000+ with 7+ wishes       -> "high print (1000+), wishlist 7+"
+      5. no print info with 7+ wishes      -> "no print info, wishlist 7+"
+      6. last resort (GRAB_LAST_RESORT): the best card with 1-6 wishes among
+         mid prints and print-less cards
+    When no card shows a print number at all, a pure wishlist ladder applies
+    (7+ preferred, then any positive count).  Returns (None, "") when the
+    drop must not be grabbed at all.
     """
-    numbered_cards = [
-        card for card in evaluation.cards if card.print_number is not None
-    ]
-    if numbered_cards:
-        eligible = [
-            card
-            for card in numbered_cards
-            if card.print_number is not None
-            and card.print_number <= MAX_TARGET_PRINT_NUMBER
-        ]
-        if eligible:
-            return min(eligible, key=lambda card: (card.print_number, card.slot))
-        if not FALLBACK_TO_WISHLIST:
-            return None
+    threshold = HIGH_PRINT_WISHLIST_THRESHOLD
+    printed = [card for card in evaluation.cards if card.print_number is not None]
+    unknown = [card for card in evaluation.cards if card.print_number is None]
+    bands: list[list[EvaluatedCard]] = ([], [], [], [])
+    for card in printed:
+        bands[_print_band(card.print_number)].append(card)
 
-    eligible = [card for card in evaluation.cards if card.wishlist_count > 0]
-    if not eligible:
-        return None
-    return max(eligible, key=lambda card: (card.wishlist_count, -card.slot))
+    if bands[0]:
+        return _best_of(bands[0]), "single print (1-9)"
+    if bands[1]:
+        return _best_of(bands[1]), "low print (10-99)"
+    mp_good = [card for card in bands[2] if card.wishlist_count >= threshold]
+    if mp_good:
+        return _best_of(mp_good), f"mid print (100-999), wishlist {threshold}+"
+    hp_good = [card for card in bands[3] if card.wishlist_count >= threshold]
+    if hp_good:
+        return _best_of(hp_good), f"high print (1000+), wishlist {threshold}+"
+    unknown_good = [card for card in unknown if card.wishlist_count >= threshold]
+    if unknown_good:
+        return _best_of(unknown_good), f"no print info, wishlist {threshold}+"
+
+    if not printed:
+        # No print numbers anywhere: rank by wishlist count alone.
+        if GRAB_LAST_RESORT:
+            weak = [card for card in unknown if card.wishlist_count > 0]
+            if weak:
+                return _best_of(weak), "wishlist only (no print info)"
+        return None, ""
+
+    if GRAB_LAST_RESORT:
+        mp_weak = [card for card in bands[2] if card.wishlist_count > 0]
+        if mp_weak:
+            return _best_of(mp_weak), "mid print (100-999), low wishlist (last resort)"
+        unknown_weak = [card for card in unknown if card.wishlist_count > 0]
+        if unknown_weak:
+            return _best_of(unknown_weak), "no print info, low wishlist (last resort)"
+    return None, ""
+
+
+def choose_card(evaluation: Evaluation) -> EvaluatedCard | None:
+    """The chosen card under the tiered grabbing rules (see explain_choice)."""
+    card, _reason = explain_choice(evaluation)
+    return card
