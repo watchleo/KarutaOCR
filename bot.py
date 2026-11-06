@@ -559,13 +559,21 @@ class KarutaClient(discord.Client):
         evaluation = pending.evaluation
         if self.pending_drops.get(channel_id) is not pending:
             return
-        if pending.evaluation_processed or pending.card_message is None or evaluation is None:
+        if pending.evaluation_processed or evaluation is None:
+            return
+        if pending.card_message is None:
+            log.info("Evaluator output ready in %s; waiting for the drop image.", channel_id)
             return
 
         pending.evaluation_processed = True
         chosen = choose_card(evaluation)
         if chosen is None:
-            log.info("No eligible card in the evaluator output.")
+            candidates = "; ".join(
+                f"slot {card.slot}: {card.name} "
+                f"(wishlist={card.wishlist_count}, print=#{card.print_number})"
+                for card in evaluation.cards
+            )
+            log.warning("No eligible card in evaluator output: %s", candidates)
             return
         if time.time() >= pending.expires_at:
             return

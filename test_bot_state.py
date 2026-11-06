@@ -312,6 +312,55 @@ class BotStateTests(unittest.TestCase):
             image_message, "1\ufe0f\u20e3", pending.expires_at
         )
 
+    def test_evaluator_waiting_for_drop_image_is_logged(self) -> None:
+        channel_id = 123
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(datetime.now(timezone.utc) + timedelta(seconds=59)).timestamp(),
+            evaluation=SimpleNamespace(cards=(), expires_at=None),
+        )
+        client = object.__new__(KarutaClient)
+        client.pending_drops = {channel_id: pending}
+
+        with patch("bot.log.info") as log_info:
+            asyncio.run(KarutaClient._process_pending_drop(client, channel_id, pending))
+
+        log_info.assert_called_once_with(
+            "Evaluator output ready in %s; waiting for the drop image.", channel_id
+        )
+        self.assertFalse(pending.evaluation_processed)
+
+    def test_ineligible_cards_are_logged_with_wishlist_and_print(self) -> None:
+        channel_id = 123
+        now = datetime.now(timezone.utc)
+        pending = PendingDrop(
+            announcement_id=1,
+            expires_at=(now + timedelta(seconds=59)).timestamp(),
+            card_message=SimpleNamespace(),
+            evaluation=SimpleNamespace(
+                cards=(
+                    SimpleNamespace(
+                        slot=1, name="First", wishlist_count=0, print_number=85233
+                    ),
+                ),
+                expires_at=None,
+            ),
+        )
+        client = object.__new__(KarutaClient)
+        client.pending_drops = {channel_id: pending}
+
+        with (
+            patch("bot.choose_card", return_value=None),
+            patch("bot.log.warning") as log_warning,
+        ):
+            asyncio.run(KarutaClient._process_pending_drop(client, channel_id, pending))
+
+        log_warning.assert_called_once_with(
+            "No eligible card in evaluator output: %s",
+            "slot 1: First (wishlist=0, print=#85233)",
+        )
+        self.assertTrue(pending.evaluation_processed)
+
 
 if __name__ == "__main__":
     unittest.main()

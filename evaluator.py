@@ -15,6 +15,7 @@ _EXPIRATION = re.compile(r"<t:(\d+)(?::[tTdDfFR])?>")
 PRINT_PRIORITY_RANGES = ((1, 9), (10, 99), (100, 999))
 MIN_WISHLIST_FOR_PRINTS_100_TO_999 = 1
 MIN_WISHLIST_FOR_PRINTS_1000_PLUS = 7
+FALLBACK_TO_WISHLIST = True
 
 
 @dataclass(frozen=True)
@@ -108,5 +109,13 @@ def choose_card(evaluation: Evaluation) -> EvaluatedCard | None:
     ]
     if high_print_cards:
         return max(high_print_cards, key=lambda card: (card.wishlist_count, -card.slot))
+
+    if FALLBACK_TO_WISHLIST and all(
+        card.print_number is not None and card.print_number > 999
+        for card in numbered_cards
+    ):
+        eligible = [card for card in evaluation.cards if card.wishlist_count > 0]
+        if eligible:
+            return max(eligible, key=lambda card: (card.wishlist_count, -card.slot))
 
     return None

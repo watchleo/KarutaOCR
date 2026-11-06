@@ -17,7 +17,10 @@ wishlist count within the best eligible range. Prints 1–99 are always eligible
 prints 100–999 require at least one wishlist. Prints 1000+ are eligible only
 with at least seven wishlists. Ties go to the lower slot number. If the
 evaluator omits print numbers, it chooses the slot with the highest positive
-wishlist count; it skips if no card qualifies.
+wishlist count. If every reported print is above 999 and none meets the
+seven-wishlist threshold, it falls back to the highest positive wishlist count
+(`FALLBACK_TO_WISHLIST` in `evaluator.py`, enabled by default). It skips if no
+card qualifies.
 
 Evaluator lines should look like:
 

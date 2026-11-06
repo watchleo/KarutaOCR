@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from evaluator import choose_card, parse_evaluator_message
 
@@ -102,7 +103,7 @@ class EvaluatorMessageTests(unittest.TestCase):
         assert chosen is not None
         self.assertEqual((chosen.slot, chosen.name), (2, "Some wishes"))
 
-    def test_prints_1000_plus_require_seven_wishes(self) -> None:
+    def test_prints_1000_plus_fall_back_to_wishlist_counts(self) -> None:
         below_threshold = parse_evaluator_message(
             "<:no_1:1> `♡` `6` · `#1000` · `◈1` · **Below threshold** · Series\n"
             "<:no_2:2> `♡` `2` · `#10000` · `◈1` · **Also below** · Series"
@@ -116,11 +117,40 @@ class EvaluatorMessageTests(unittest.TestCase):
         self.assertIsNotNone(at_threshold)
         assert below_threshold is not None
         assert at_threshold is not None
-        self.assertIsNone(choose_card(below_threshold))
+        chosen = choose_card(below_threshold)
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual((chosen.slot, chosen.name), (1, "Below threshold"))
         chosen = choose_card(at_threshold)
         self.assertIsNotNone(chosen)
         assert chosen is not None
         self.assertEqual((chosen.slot, chosen.name), (2, "At threshold"))
+
+    def test_high_print_wishlist_fallback_can_be_disabled(self) -> None:
+        evaluation = parse_evaluator_message(
+            "<:no_1:1> `♡` `2` · `#85260` · **Shuu Maiko** · Nisekoi"
+        )
+
+        self.assertIsNotNone(evaluation)
+        assert evaluation is not None
+        with patch("evaluator.FALLBACK_TO_WISHLIST", False):
+            self.assertIsNone(choose_card(evaluation))
+
+    def test_cardcompanion_high_print_drop_selects_most_wished_card(self) -> None:
+        evaluation = parse_evaluator_message(
+            "<:no_1:1> `♡` `0` · `#85233` · **Kouichiro Kase** · Knight Hunters\n"
+            "<:no_2:2> `♡` `2` · `#85260` · **Shuu Maiko** · Nisekoi\n"
+            "<:no_3:3> `♡` `1` · `#13514` · **VISCO** · Marvel Future Avengers\n"
+            "Drop expires <t:1793755181:R>."
+        )
+
+        self.assertIsNotNone(evaluation)
+        assert evaluation is not None
+        self.assertEqual(evaluation.expires_at, 1793755181)
+        chosen = choose_card(evaluation)
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual((chosen.slot, chosen.name), (2, "Shuu Maiko"))
 
     def test_skips_when_all_wishlist_counts_are_zero(self) -> None:
         evaluation = parse_evaluator_message(
