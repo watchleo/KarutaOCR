@@ -179,7 +179,7 @@ variation. Successful grabs use a 10-minute cooldown; failed or unconfirmed
 grabs use a 75-second cooldown. The command schedule and installation ID are
 saved in `kd-state.json` under `DATA_DIR`.
 
-## What changed in this build (round 7)
+## Current grab selection behavior
 
 The grabbing choice now implements the tiered priority rules exactly as
 specified: **range first, wishlist count within the range**:
@@ -206,7 +206,7 @@ specified: **range first, wishlist count within the range**:
    or `Skipping drop ... - no card met the grabbing rules`, so every
    decision can be checked against the rules by reading the log alone.
 
-## What changed in the previous build (round 6)
+## Superseded behavior (historical)
 
 > Historical note: round 6's tiebreak fix (point 1 below) was superseded by
 > the round 7 tiered rules — under those rules the 05:17 drop is skipped
@@ -335,7 +335,7 @@ Python 3.10 or newer is required.
 
 ## Testing
 
-Run the evaluator parser tests with:
+Run the complete unit-test suite with:
 
 ```sh
 python -m unittest
@@ -348,3 +348,9 @@ python -m unittest
 - If a credential is exposed, revoke or rotate it with the provider immediately.
 - Do not share credentials in bug reports. See [SECURITY.md](SECURITY.md) for
   vulnerability reporting guidance.
+
+## License
+
+This project is distributed under the ISC License; see [LICENSE](LICENSE).
+Third-party packages and the bundled `discord.py-self` wheel remain subject
+to their respective licenses.
